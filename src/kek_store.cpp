@@ -32,7 +32,7 @@ LPCWSTR ProviderName(uint8_t provider_type) {
 }
 
 // Opens the existing persisted KEK by name on the given provider, or creates
-// it (non-exportable, key-agreement-only, current-user scoped) if it does
+// it (non-exportable, key-agreement-only, machine-wide scoped) if it does
 // not yet exist. Throws HkdfGuardError(HKDFGUARD_ERR_PROVIDER) on any
 // failure, including the provider itself being unavailable.
 ResolvedKek ResolveOrCreateOnProvider(
@@ -59,8 +59,18 @@ ResolvedKek ResolveOrCreateOnProvider(
 
     std::wstring name = KeyName(service, key_id);
 
-    // dwFlags = 0 (no NCRYPT_MACHINE_KEY_FLAG) => current-user scope.
-    status = NCryptOpenKey(result.provider.get(), result.key.put(), name.c_str(), 0, 0);
+    // NCRYPT_MACHINE_KEY_FLAG => this key lives in the machine-wide key
+    // store, not the calling account's own profile: any local account can
+    // open/use it (subject to the key's ACL, left at NCrypt's default for
+    // a machine key), not only the one that created it. This is
+    // deliberate - the deployment model this project targets is "a
+    // deployment-time process, typically elevated, wraps a DEK once; a
+    // different, lower-privileged service account unwraps it later" - see
+    // OpenKekForUnwrap below, which must request the same flag for that
+    // second account's NCryptOpenKey to find this key at all (per-user and
+    // machine-wide are two disjoint key stores from NCrypt's perspective,
+    // not a fallback chain).
+    status = NCryptOpenKey(result.provider.get(), result.key.put(), name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG);
     if (status == ERROR_SUCCESS) {
         // The key already existed from a previous call - nothing left to
         // do, hand back what we've got. Returning `result` here moves it
@@ -76,10 +86,16 @@ ResolvedKek ResolveOrCreateOnProvider(
         throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenKey failed");
     }
 
-    // Key does not exist yet on this provider: create it.
+    // Key does not exist yet on this provider: create it, machine-wide
+    // (see the NCryptOpenKey call above for why). Creating a machine key
+    // requires the calling process to be running elevated - by design, per
+    // the deployment model this targets: an elevated deployment-time
+    // utility calls hkdfguard_wrap_dek once (which creates the KEK on
+    // first use), and the lower-privileged account that unwraps it later
+    // never needs to create anything.
     status = NCryptCreatePersistedKey(
         result.provider.get(), result.key.put(),
-        NCRYPT_ECDH_P256_ALGORITHM, name.c_str(), 0, 0);
+        NCRYPT_ECDH_P256_ALGORITHM, name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG);
     if (status != ERROR_SUCCESS) {
         throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptCreatePersistedKey failed");
     }
@@ -157,8 +173,14 @@ ResolvedKek OpenKekForUnwrap(const std::wstring& service, uint8_t provider_type,
     // that's treated as an unconditional failure; unwrap must never create
     // a new KEK, since a newly-created key could never actually decrypt
     // anything wrapped under whatever KEK originally produced this payload.
+    // NCRYPT_MACHINE_KEY_FLAG must match what the key was created with
+    // (see ResolveOrCreateOnProvider) - this is exactly what lets an
+    // account other than the one that wrapped the DEK successfully find
+    // and use this key: opening without the flag would search that
+    // account's own per-user key store instead, where this key was never
+    // created, and fail with NTE_BAD_KEYSET regardless of privileges.
     std::wstring name = KeyName(service, key_id);
-    status = NCryptOpenKey(result.provider.get(), result.key.put(), name.c_str(), 0, 0);
+    status = NCryptOpenKey(result.provider.get(), result.key.put(), name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG);
     if (status != ERROR_SUCCESS) {
         throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenKey failed");
     }
@@ -175,7 +197,10 @@ void DeleteKek(const std::wstring& service, uint8_t provider_type, uint32_t key_
 
     std::wstring name = KeyName(service, key_id);
     ScopedNCryptKey key;
-    status = NCryptOpenKey(provider.get(), key.put(), name.c_str(), 0, 0);
+    // Same NCRYPT_MACHINE_KEY_FLAG requirement as OpenKekForUnwrap above -
+    // this key was created machine-wide, so it must also be opened (in
+    // order to then be deleted) machine-wide.
+    status = NCryptOpenKey(provider.get(), key.put(), name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG);
     if (status != ERROR_SUCCESS) {
         throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenKey failed");
     }

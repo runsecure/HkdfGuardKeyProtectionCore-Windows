@@ -24,7 +24,7 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 
 # Declares the "hkdfguard" build target: a SHARED library (a .dll on
 # Windows, plus a companion .lib "import library" other code links against
-# to call into it), built from exactly these five .cpp files. Each .cpp's
+# to call into it), built from exactly these six .cpp files. Each .cpp's
 # own #include of its matching .h pulls the rest of the source tree in as
 # needed - CMake itself doesn't need to know about the .h files here.
 add_library(hkdfguard SHARED
@@ -33,7 +33,18 @@ add_library(hkdfguard SHARED
     src/kek_store.cpp
     src/ecdh_hkdf.cpp
     src/aes_gcm.cpp
+    src/direct_aead.cpp
 )
+
+# Names the actual output files (the .dll and its companion .lib import
+# library) after the specific KMS "suite" this build implements - the
+# (Key Encapsulation, Hash, symmetric cipher) recipe used for DEK
+# wrap/unwrap: ECDH P-256 + HKDF-SHA512 + AES-256-GCM. Only changes what
+# lands on disk - the CMake target itself is still named "hkdfguard"
+# everywhere else in this file and in tests/CMakeLists.txt (e.g.
+# target_link_libraries, $<TARGET_FILE_DIR:hkdfguard>), so nothing else
+# needs to change when this name does.
+set_target_properties(hkdfguard PROPERTIES OUTPUT_NAME "HkdfGuard.Kms.P256Sha512AesGcm256")
 
 # PRIVATE compile definitions apply only while compiling hkdfguard's own
 # .cpp files, not to anything that later links against it. HKDFGUARD_EXPORTS
@@ -69,6 +80,11 @@ if(MSVC)
     target_compile_options(hkdfguard PRIVATE /W4 /guard:cf /GS)
     target_link_options(hkdfguard PRIVATE /GUARD:CF)
 endif()
+
+# tools/CMakeLists.txt declares hkdfguard-v1-initialize, the standalone CLI
+# utility that wraps a DEK and writes it to a file - see that file for why
+# it's a separate add_subdirectory rather than folded into this one.
+add_subdirectory(tools)
 
 # Turns on CTest support (the `ctest` command used in README.md) and pulls
 # in tests/CMakeLists.txt, which declares the test_roundtrip executable and

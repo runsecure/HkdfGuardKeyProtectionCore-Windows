@@ -6,6 +6,7 @@
 #include "../include/hkdfguard.h"
 
 #include "aes_gcm.h"
+#include "direct_aead.h"
 #include "ecdh_hkdf.h"
 #include "errors.h"
 #include "kek_store.h"
@@ -13,7 +14,8 @@
 #include "wire_format.h"
 
 // windows.h: MultiByteToWideChar, CP_UTF8, MB_ERR_INVALID_CHARS (used by
-// ValidateAndConvertService below). cstring: strnlen. string: std::wstring.
+// ValidateAndConvertService below). cstring: strnlen, memcpy. string:
+// std::wstring.
 #include <windows.h>
 #include <cstring>
 #include <string>
@@ -79,6 +81,31 @@ std::wstring ValidateAndConvertService(const char* service) {
     return wide;
 }
 
+// RAII guard that zeroes a caller-owned key buffer (via a raw pointer, not
+// a copy this project made) the instant it goes out of scope - the C++
+// equivalent of this project's macOS implementation's
+// `defer { memset(keyPtr, 0, keyLen) }` and its Linux implementation's
+// `ZeroKeyOnDrop`. Constructing one of these, in each of the four new ABI
+// functions below, is what "every exit path from here on zeroes the key"
+// means concretely: however the enclosing function returns - an early
+// `return`, falling off the end, or an exception unwinding past it (every
+// exception this project throws is still caught within the same function,
+// per the "no exception crosses the ABI" rule, but the guard's destructor
+// runs during that unwind regardless, exactly as it would for a normal
+// return) - this type's destructor runs and zeroes exactly `len` bytes
+// starting at `ptr`.
+class KeyZeroGuard {
+public:
+    KeyZeroGuard(uint8_t* ptr, size_t len) : ptr_(ptr), len_(len) {}
+    ~KeyZeroGuard() { SecureZero(ptr_, len_); }
+    KeyZeroGuard(const KeyZeroGuard&) = delete;
+    KeyZeroGuard& operator=(const KeyZeroGuard&) = delete;
+
+private:
+    uint8_t* ptr_;
+    size_t len_;
+};
+
 } // namespace
 
 // `extern "C"` here (repeated at each function, rather than wrapping both
@@ -122,13 +149,16 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
 
         std::wstring service_name = ValidateAndConvertService(service);
 
-        // Resolve (create if necessary) the current user's persistent KEK
-        // for this service, preferring the TPM/vTPM-backed Platform Crypto
+        // Resolve (create if necessary) this service's machine-wide
+        // persistent KEK, preferring the TPM/vTPM-backed Platform Crypto
         // Provider and falling back to the Software Key Storage Provider
-        // automatically.
+        // automatically. Creating it for the first time requires this
+        // process to be elevated (see kek_store.h/.cpp) - by design, for a
+        // deployment-time wrap step ahead of a separate account unwrapping
+        // later.
         ResolvedKek kek = ResolveOrCreateKekForWrap(service_name);
 
-        // Ephemeral ECDH + HKDF-SHA256 -> 32-byte AES wrapping key. Only the
+        // Ephemeral ECDH + HKDF-SHA512 -> 32-byte AES wrapping key. Only the
         // KEK's public key is needed here, so this never touches the TPM.
         uint8_t ephemeral_pub[kEphemeralPubLen];
         // `nonce`/`ciphertext`/`tag` are declared here, *outside* the nested
@@ -152,13 +182,21 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
             // unwiped, for the length of SerializeWrappedDek and the
             // `return` below). This is the same "shrink the scope to
             // shrink the lifetime" technique used for `prk` inside
-            // ecdh_hkdf.cpp's HkdfSha256.
+            // ecdh_hkdf.cpp's HkdfSha512.
             SecureBuffer<32> wrapping_key;
             DeriveWrappingKeyForWrap(kek.key.get(), ephemeral_pub, wrapping_key);
 
             // AES-256-GCM directly from the caller's dek pointer - no
-            // intermediate plaintext staging buffer.
-            AesGcmEncrypt(wrapping_key.data(), dek, static_cast<unsigned long>(dek_len), nonce, ciphertext, tag);
+            // intermediate plaintext staging buffer. AAD is the caller's
+            // `service` string itself (raw UTF-8 bytes, not the wide
+            // NCrypt-key-name form `service_name` above): binds this
+            // ciphertext to the exact service it was wrapped for, matching
+            // this project's macOS and Linux implementations, which use
+            // the identical AAD for the identical reason.
+            AesGcmEncrypt(
+                wrapping_key.data(), dek, static_cast<unsigned long>(dek_len),
+                reinterpret_cast<const uint8_t*>(service), static_cast<unsigned long>(strlen(service)),
+                nonce, ciphertext, tag);
         } // <- wrapping_key's destructor (zeroing it) runs here, right now.
 
         // Assemble the final 132-byte payload directly into the caller's
@@ -248,15 +286,19 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
             // unused, until the function returns.
             SecureBuffer<32> wrapping_key;
             // ECDH against the KEK's private key (may execute inside a
-            // TPM/vTPM) + HKDF-SHA256 -> the same 32-byte wrapping key
+            // TPM/vTPM) + HKDF-SHA512 -> the same 32-byte wrapping key
             // derived at wrap time.
             DeriveWrappingKeyForUnwrap(kek.provider.get(), kek.key.get(), parsed.ephemeral_pub, wrapping_key);
 
             // Decrypt directly into the caller's buffer - no intermediate
-            // plaintext staging buffer.
+            // plaintext staging buffer. AAD must match what AesGcmEncrypt
+            // used at wrap time: the same `service` string passed into
+            // this call.
             AesGcmDecrypt(
                 wrapping_key.data(), parsed.nonce, parsed.ciphertext,
-                static_cast<unsigned long>(kCiphertextLen), parsed.tag, out);
+                static_cast<unsigned long>(kCiphertextLen),
+                reinterpret_cast<const uint8_t*>(service), static_cast<unsigned long>(strlen(service)),
+                parsed.tag, out);
         } // <- wrapping_key's destructor (zeroing it) runs here, right now.
 
         // Success: `out` now holds the recovered plaintext DEK (its one
@@ -278,4 +320,189 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
     } catch (...) {
         return fail(HKDFGUARD_ERR_INTERNAL);
     }
+}
+
+extern "C" HKDFGUARD_API int32_t hkdfguard_encrypt(
+    uint8_t* key, int32_t key_len,
+    const uint8_t* plaintext, int32_t plaintext_len,
+    const uint8_t* aad, int32_t aad_len,
+    uint8_t* result, int32_t result_len) {
+    if (key_len != 16 && key_len != 24 && key_len != 32) {
+        // Nothing has been validated as safe to touch yet, so nothing to
+        // zero - matches this project's macOS/Linux implementations, which
+        // leave the key buffer alone on exactly this one failure path.
+        return HKDFGUARD_ERR_INVALID_ARG;
+    }
+    if (key == nullptr) {
+        return HKDFGUARD_ERR_INVALID_ARG;
+    }
+    // From here on, every exit path zeroes the caller's key buffer via
+    // this guard's destructor - see KeyZeroGuard's doc comment above.
+    KeyZeroGuard key_guard(key, static_cast<size_t>(key_len));
+
+    try {
+        if (plaintext_len < 0 || aad_len < 0 || result_len < 0) {
+            return HKDFGUARD_ERR_INVALID_ARG;
+        }
+        if (plaintext_len > 0 && plaintext == nullptr) {
+            return HKDFGUARD_ERR_INVALID_ARG;
+        }
+        if (aad_len > 0 && aad == nullptr) {
+            return HKDFGUARD_ERR_INVALID_ARG;
+        }
+
+        // int64_t here (not int32_t) purely to avoid a theoretical overflow
+        // if plaintext_len were close to INT32_MAX; the actual comparison
+        // and cast back to int32_t below are only ever reached once
+        // required_len is known to fit.
+        const int64_t required_len = static_cast<int64_t>(plaintext_len) + static_cast<int64_t>(kDirectAeadOverhead);
+        if (static_cast<int64_t>(result_len) < required_len) {
+            return HKDFGUARD_ERR_BUFFER_TOO_SMALL;
+        }
+        if (result == nullptr) {
+            // Capacity was fine (possibly 0) but there's nowhere to
+            // actually write.
+            return HKDFGUARD_ERR_INVALID_ARG;
+        }
+
+        uint8_t nonce[kDirectAeadNonceLen];
+        uint8_t tag[kDirectAeadTagLen];
+        // Ciphertext is written directly into its final position inside
+        // the caller's buffer - no intermediate staging buffer - the same
+        // "write straight into the destination" style AesGcmEncrypt uses
+        // for the wrap path.
+        DirectAesGcmEncrypt(
+            key, static_cast<size_t>(key_len),
+            plaintext, static_cast<unsigned long>(plaintext_len),
+            aad, static_cast<unsigned long>(aad_len),
+            nonce,
+            result + kDirectAeadNonceLen,
+            tag);
+
+        // Assemble `nonce || ciphertext || tag`: the ciphertext is already
+        // in place from the call above, so only the nonce and tag (both
+        // small, fixed-size, and not secret) need copying in.
+        std::memcpy(result, nonce, kDirectAeadNonceLen);
+        std::memcpy(result + kDirectAeadNonceLen + static_cast<size_t>(plaintext_len), tag, kDirectAeadTagLen);
+
+        return static_cast<int32_t>(required_len);
+    } catch (const HkdfGuardError& e) {
+        return e.code();
+    } catch (...) {
+        return HKDFGUARD_ERR_INTERNAL;
+    }
+}
+
+extern "C" HKDFGUARD_API int32_t hkdfguard_decrypt(
+    uint8_t* key, int32_t key_len,
+    const uint8_t* ciphertext, int32_t ciphertext_len,
+    const uint8_t* aad, int32_t aad_len,
+    uint8_t* result, int32_t result_len) {
+    if (key_len != 16 && key_len != 24 && key_len != 32) {
+        return HKDFGUARD_ERR_INVALID_ARG;
+    }
+    if (key == nullptr) {
+        return HKDFGUARD_ERR_INVALID_ARG;
+    }
+    KeyZeroGuard key_guard(key, static_cast<size_t>(key_len));
+
+    // Same "zero the caller's declared capacity on any failure" policy as
+    // hkdfguard_unwrap_dek's `fail` lambda above, and for the identical
+    // reason: BCryptDecrypt (via DirectAesGcmDecrypt) can write
+    // unauthenticated plaintext into `result` even when it ultimately
+    // fails, so every non-success return here must leave `result` zeroed
+    // rather than only the ones that plausibly wrote to it.
+    const int32_t result_capacity = result_len;
+    auto fail = [&](int32_t code) {
+        if (result != nullptr && result_capacity > 0) {
+            SecureZero(result, static_cast<size_t>(result_capacity));
+        }
+        return code;
+    };
+
+    try {
+        if (aad_len < 0 || result_len < 0 || ciphertext_len < static_cast<int32_t>(kDirectAeadOverhead)) {
+            return fail(HKDFGUARD_ERR_INVALID_ARG);
+        }
+        if (ciphertext == nullptr) {
+            return fail(HKDFGUARD_ERR_INVALID_ARG);
+        }
+        if (aad_len > 0 && aad == nullptr) {
+            return fail(HKDFGUARD_ERR_INVALID_ARG);
+        }
+
+        const int32_t plaintext_len = ciphertext_len - static_cast<int32_t>(kDirectAeadOverhead);
+        if (result_len < plaintext_len) {
+            return fail(HKDFGUARD_ERR_BUFFER_TOO_SMALL);
+        }
+        if (plaintext_len > 0 && result == nullptr) {
+            return fail(HKDFGUARD_ERR_INVALID_ARG);
+        }
+
+        const uint8_t* nonce = ciphertext;
+        const uint8_t* ciphertext_body = ciphertext + kDirectAeadNonceLen;
+        const uint8_t* tag = ciphertext + kDirectAeadNonceLen + static_cast<size_t>(plaintext_len);
+
+        // Decrypt directly into the caller's buffer - no intermediate
+        // plaintext staging buffer.
+        DirectAesGcmDecrypt(
+            key, static_cast<size_t>(key_len),
+            nonce,
+            ciphertext_body, static_cast<unsigned long>(plaintext_len),
+            aad, static_cast<unsigned long>(aad_len),
+            tag,
+            result);
+
+        return plaintext_len;
+    } catch (const HkdfGuardError& e) {
+        return fail(e.code());
+    } catch (...) {
+        return fail(HKDFGUARD_ERR_INTERNAL);
+    }
+}
+
+extern "C" HKDFGUARD_API int32_t hkdfguard_encrypt_with_wrapped_dek(
+    const char* service,
+    const uint8_t* wrapped_dek, int32_t wrapped_dek_len,
+    const uint8_t* plaintext, int32_t plaintext_len,
+    const uint8_t* aad, int32_t aad_len,
+    uint8_t* result, int32_t result_len) {
+    // Recovers the DEK into a SecureBuffer (zeroed on scope exit) rather
+    // than a plain array - belt and suspenders on top of the fact that
+    // hkdfguard_encrypt below already zeroes whatever key buffer it's
+    // handed, via the pointer passed to it, on every one of its own exit
+    // paths. By the time this function returns, `dek`'s bytes are already
+    // zero either way; SecureBuffer's own destructor is a harmless no-op
+    // on top of that. This mirrors the "raw DEK never leaves this call"
+    // guarantee this project's macOS/Linux implementations document for
+    // their equivalent functions.
+    SecureBuffer<32> dek;
+    int32_t dek_len = static_cast<int32_t>(dek.size());
+    int32_t unwrap_rc = hkdfguard_unwrap_dek(service, wrapped_dek, wrapped_dek_len, dek.data(), &dek_len);
+    if (unwrap_rc != HKDFGUARD_OK) {
+        // hkdfguard_unwrap_dek already zeroed `dek` on its own failure
+        // paths (it's the exact same caller-buffer-zeroing contract as
+        // hkdfguard_unwrap_dek always provides), so there's nothing further
+        // to clean up here - just propagate whichever stage's status code
+        // this is.
+        return unwrap_rc;
+    }
+
+    return hkdfguard_encrypt(dek.data(), dek_len, plaintext, plaintext_len, aad, aad_len, result, result_len);
+}
+
+extern "C" HKDFGUARD_API int32_t hkdfguard_decrypt_with_wrapped_dek(
+    const char* service,
+    const uint8_t* wrapped_dek, int32_t wrapped_dek_len,
+    const uint8_t* ciphertext, int32_t ciphertext_len,
+    const uint8_t* aad, int32_t aad_len,
+    uint8_t* result, int32_t result_len) {
+    SecureBuffer<32> dek;
+    int32_t dek_len = static_cast<int32_t>(dek.size());
+    int32_t unwrap_rc = hkdfguard_unwrap_dek(service, wrapped_dek, wrapped_dek_len, dek.data(), &dek_len);
+    if (unwrap_rc != HKDFGUARD_OK) {
+        return unwrap_rc;
+    }
+
+    return hkdfguard_decrypt(dek.data(), dek_len, ciphertext, ciphertext_len, aad, aad_len, result, result_len);
 }

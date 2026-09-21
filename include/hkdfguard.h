@@ -147,6 +147,96 @@ HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
     const uint8_t* wrapped, int32_t wrapped_len,
     uint8_t* out, int32_t* out_len);
 
+/*
+ * Direct AES-GCM encrypt/decrypt under a caller-supplied key (typically a
+ * DEK already recovered via hkdfguard_unwrap_dek above), rather than a
+ * Secure Enclave/TPM-backed KEK. `key_len` must be 16, 24, or 32
+ * (AES-128/192/256). Unlike hkdfguard_wrap_dek/hkdfguard_unwrap_dek above,
+ * these two do NOT use the out_len in/out-capacity convention: a
+ * non-negative return is the number of bytes written to `result`; a
+ * negative return is one of the HKDFGUARD_ERR_* codes above. This matches
+ * the calling convention used by this project's macOS and Linux
+ * implementations for the same four functions (this pair, plus the two
+ * "_with_wrapped_dek" functions further below).
+ *
+ * Payload layout, both what hkdfguard_encrypt writes and what
+ * hkdfguard_decrypt expects to read:
+ *   [12-byte nonce][ciphertext, same length as the plaintext][16-byte tag]
+ *
+ * `key` is NOT const in either function below: both zero it in place (all
+ * `key_len` bytes) before returning, on every exit path except an invalid
+ * `key_len` (nothing has been validated as safe to touch on that path).
+ * Callers must not reuse that buffer as key material afterward.
+ */
+
+/*
+ * `result` must have capacity for at least `plaintext_len + 28` bytes.
+ * `aad`/`aad_len` may be NULL/0 for no additional authenticated data.
+ */
+HKDFGUARD_API int32_t hkdfguard_encrypt(
+    uint8_t* key, int32_t key_len,
+    const uint8_t* plaintext, int32_t plaintext_len,
+    const uint8_t* aad, int32_t aad_len,
+    uint8_t* result, int32_t result_len);
+
+/*
+ * `ciphertext` must be a `nonce || ciphertext || tag` payload produced by
+ * hkdfguard_encrypt (at least 28 bytes - an empty original plaintext still
+ * produces a 28-byte payload). `result` must have capacity for at least
+ * `ciphertext_len - 28` bytes. `aad`/`aad_len` must match what was passed
+ * to hkdfguard_encrypt, or decryption fails with HKDFGUARD_ERR_AUTH_FAILED.
+ *
+ * On any failure, every byte of the caller's originally-declared `result`
+ * capacity is zeroed before returning - unlike hkdfguard_encrypt, since
+ * BCryptDecrypt (the underlying CNG call) can write unauthenticated
+ * plaintext into `result` even when it ultimately fails.
+ */
+HKDFGUARD_API int32_t hkdfguard_decrypt(
+    uint8_t* key, int32_t key_len,
+    const uint8_t* ciphertext, int32_t ciphertext_len,
+    const uint8_t* aad, int32_t aad_len,
+    uint8_t* result, int32_t result_len);
+
+/*
+ * Combines hkdfguard_unwrap_dek and hkdfguard_encrypt/hkdfguard_decrypt
+ * above into a single call: given a wrapped DEK (as produced by
+ * hkdfguard_wrap_dek) and the same `service` it was wrapped under, these
+ * unwrap it under the persistent KEK and immediately use the recovered DEK
+ * for AES-GCM encryption/decryption. The raw DEK never crosses this
+ * boundary at all - it exists only inside this library, for the duration
+ * of one call, and is zeroed before returning.
+ *
+ * Return value: same convention as hkdfguard_encrypt/hkdfguard_decrypt - a
+ * non-negative return is the byte count written to `result`; a negative
+ * return is one of the HKDFGUARD_ERR_* codes above, from whichever stage
+ * (unwrapping, or the AES-GCM operation) failed first.
+ *
+ * `result` must have capacity for at least `plaintext_len + 28` bytes.
+ * `aad`/`aad_len` may be NULL/0 for no additional authenticated data.
+ */
+HKDFGUARD_API int32_t hkdfguard_encrypt_with_wrapped_dek(
+    const char* service,
+    const uint8_t* wrapped_dek, int32_t wrapped_dek_len,
+    const uint8_t* plaintext, int32_t plaintext_len,
+    const uint8_t* aad, int32_t aad_len,
+    uint8_t* result, int32_t result_len);
+
+/*
+ * `ciphertext` must be a `nonce || ciphertext || tag` payload produced by
+ * hkdfguard_encrypt or hkdfguard_encrypt_with_wrapped_dek (at least 28
+ * bytes). `result` must have capacity for at least `ciphertext_len - 28`
+ * bytes. `aad`/`aad_len` must match what was passed at encryption time, or
+ * decryption fails with HKDFGUARD_ERR_AUTH_FAILED. On any failure, every
+ * byte of the caller's originally-declared `result` capacity is zeroed
+ * before returning.
+ */
+HKDFGUARD_API int32_t hkdfguard_decrypt_with_wrapped_dek(
+    const char* service,
+    const uint8_t* wrapped_dek, int32_t wrapped_dek_len,
+    const uint8_t* ciphertext, int32_t ciphertext_len,
+    const uint8_t* aad, int32_t aad_len,
+    uint8_t* result, int32_t result_len);
+
 // Closes the extern "C" block opened above.
 #ifdef __cplusplus
 }

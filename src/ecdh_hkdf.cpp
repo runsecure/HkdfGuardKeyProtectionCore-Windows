@@ -17,7 +17,7 @@
 // BCRYPT_KDF_RAW_SECRET ("TRUNCATE") identifier - supported by both
 // BCryptDeriveKey and NCryptDeriveKey, since they take the same secret
 // handle shape and the same pwszKDF string - and then run a single,
-// self-contained HKDF-SHA256 (RFC 5869) implementation, written once below
+// self-contained HKDF-SHA512 (RFC 5869) implementation, written once below
 // and used identically by both paths.
 
 namespace hkdfguard {
@@ -176,21 +176,21 @@ void ExtractRawSecretFromNCrypt(NCRYPT_SECRET_HANDLE secret, SecureBuffer<kShare
     }
 }
 
-// Computes HMAC-SHA256(key, data) -> a 32-byte output. `key`/`key_len` may
+// Computes HMAC-SHA512(key, data) -> a 64-byte output. `key`/`key_len` may
 // be null/0 (used for the HKDF-Extract step with an empty salt).
 //
-// `uint8_t out[32]` here is, like the array parameters seen in other
-// headers, really just a `uint8_t*` - the literal "32" is documentation,
+// `uint8_t out[64]` here is, like the array parameters seen in other
+// headers, really just a `uint8_t*` - the literal "64" is documentation,
 // not an enforced size (see wire_format.h's note on this same notation).
-void HmacSha256(const uint8_t* key, size_t key_len, const uint8_t* data, size_t data_len, uint8_t out[32]) {
-    // Opens CNG's SHA-256 implementation, but with the
+void HmacSha512(const uint8_t* key, size_t key_len, const uint8_t* data, size_t data_len, uint8_t out[64]) {
+    // Opens CNG's SHA-512 implementation, but with the
     // BCRYPT_ALG_HANDLE_HMAC_FLAG flag - this is what makes it compute
-    // *keyed* HMAC-SHA256 rather than plain unkeyed SHA-256.
+    // *keyed* HMAC-SHA512 rather than plain unkeyed SHA-512.
     ScopedBCryptAlg alg;
     NTSTATUS status = BCryptOpenAlgorithmProvider(
-        alg.put(), BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+        alg.put(), BCRYPT_SHA512_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
     if (!BCRYPT_SUCCESS(status)) {
-        throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "open HMAC-SHA256 provider failed");
+        throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "open HMAC-SHA512 provider failed");
     }
 
     // CNG hash/HMAC operations need a caller-supplied scratch buffer
@@ -212,7 +212,7 @@ void HmacSha256(const uint8_t* key, size_t key_len, const uint8_t* data, size_t 
     // is what seeds this as an *HMAC* keyed with `key`, rather than a plain
     // hash - when `key` is null/key_len is 0 (the HKDF-Extract call below),
     // this becomes HMAC with an empty key, per RFC 5869's "no salt
-    // provided" default (see the comment on HkdfSha256 below for why that's
+    // provided" default (see the comment on HkdfSha512 below for why that's
     // equivalent).
     std::vector<uint8_t> hash_object(hash_object_len);
     ScopedBCryptHash hash;
@@ -233,9 +233,9 @@ void HmacSha256(const uint8_t* key, size_t key_len, const uint8_t* data, size_t 
         throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptHashData failed");
     }
 
-    // Finalizes the computation and writes the 32-byte HMAC-SHA256 result
+    // Finalizes the computation and writes the 64-byte HMAC-SHA512 result
     // into `out`.
-    status = BCryptFinishHash(hash.get(), out, 32, 0);
+    status = BCryptFinishHash(hash.get(), out, 64, 0);
     // The scratch buffer CNG used internally (which, depending on the key
     // this HMAC was computed with, may retain sensitive intermediate state)
     // is wiped immediately after FinishHash, *before* even checking
@@ -249,14 +249,16 @@ void HmacSha256(const uint8_t* key, size_t key_len, const uint8_t* data, size_t 
     // the function returns.
 }
 
-// HKDF-SHA256 (RFC 5869), specialized for a 32-byte output: since OKM
-// length equals the hash length, HKDF-Expand needs exactly one round
-// (T(1) = HMAC-SHA256(PRK, info || 0x01)), no truncation required. The
-// empty-salt HKDF-Extract step (HMAC-SHA256 with a zero-length key) is
+// HKDF-SHA512 (RFC 5869), specialized for a 32-byte output: since the
+// requested OKM length (32) is less than the hash length (64), HKDF-Expand
+// still needs exactly one round (T(1) = HMAC-SHA512(PRK, info || 0x01)),
+// per RFC 5869's Expand step - it's just that this T(1) is now truncated to
+// the first 32 bytes rather than used in full, since 32 < HashLen. The
+// empty-salt HKDF-Extract step (HMAC-SHA512 with a zero-length key) is
 // equivalent to RFC 5869's "no salt" default (HashLen zero bytes), because
 // HMAC zero-pads any key shorter than the block size to the same all-zero
-// 64-byte block either way.
-void HkdfSha256(const uint8_t* ikm, size_t ikm_len, const std::vector<uint8_t>& info, SecureBuffer<32>& okm_out) {
+// 128-byte block either way.
+void HkdfSha512(const uint8_t* ikm, size_t ikm_len, const std::vector<uint8_t>& info, SecureBuffer<32>& okm_out) {
     // The HKDF-Expand input, `info || 0x01` (the info bytes followed by a
     // single counter byte, per RFC 5869's definition of T(1)), doesn't
     // depend on the PRK at all, so it's fine to build it before computing
@@ -268,29 +270,37 @@ void HkdfSha256(const uint8_t* ikm, size_t ikm_len, const std::vector<uint8_t>& 
 
     // This inner `{ ... }` is an ordinary, otherwise-unremarkable C++
     // block - but introducing one here on purpose (rather than just
-    // declaring `prk` alongside `t1_input` above) is itself a deliberate
-    // security measure: `prk` (the HKDF-Extract output - itself sensitive
-    // key material derived from the ECDH shared secret) is scoped to
-    // *exactly* the two statements that need it. Its destructor - which
-    // wipes it via SecureZeroMemory, see SecureBuffer in secure_buffer.h -
-    // therefore runs the instant this block ends, immediately after its
-    // last use, rather than only at the end of the whole HkdfSha256
-    // function (which would leave it sitting in memory, unused but
-    // unwiped, through the SecureZero(t1_input...) call below).
+    // declaring `prk`/`t1` alongside `t1_input` above) is itself a
+    // deliberate security measure: `prk` and `t1` (the HKDF-Extract output
+    // and the full, untruncated HKDF-Expand output - both sensitive key
+    // material derived from the ECDH shared secret) are scoped to *exactly*
+    // the statements that need them. Their destructors - which wipe them
+    // via SecureZeroMemory, see SecureBuffer in secure_buffer.h - therefore
+    // run the instant this block ends, immediately after their last use,
+    // rather than only at the end of the whole HkdfSha512 function (which
+    // would leave them sitting in memory, unused but unwiped, through the
+    // SecureZero(t1_input...) call below).
     {
-        // HKDF-Extract: PRK = HMAC-SHA256(salt, IKM). Passing `nullptr, 0`
+        // HKDF-Extract: PRK = HMAC-SHA512(salt, IKM). Passing `nullptr, 0`
         // as the key here means "no salt" - see the empty-salt equivalence
         // explained in this function's doc comment above.
-        SecureBuffer<32> prk;
-        HmacSha256(nullptr, 0, ikm, ikm_len, prk.data());
-        // HKDF-Expand's one and only round: T(1) = HMAC-SHA256(PRK, info ||
-        // 0x01), written directly into the caller's output buffer.
-        HmacSha256(prk.data(), prk.size(), t1_input.data(), t1_input.size(), okm_out.data());
-    } // <- prk's destructor (zeroing it) runs here, right now.
+        SecureBuffer<64> prk;
+        HmacSha512(nullptr, 0, ikm, ikm_len, prk.data());
+        // HKDF-Expand's one and only round: T(1) = HMAC-SHA512(PRK, info ||
+        // 0x01). Unlike the SHA-256 version of this function, T(1) (64
+        // bytes) is now larger than the 32-byte output this function
+        // promises, so it's computed into its own buffer first...
+        SecureBuffer<64> t1;
+        HmacSha512(prk.data(), prk.size(), t1_input.data(), t1_input.size(), t1.data());
+        // ...and then truncated to the first 32 bytes, per RFC 5869's
+        // HKDF-Expand definition (OKM = T(1) truncated to L octets, when
+        // L <= HashLen).
+        memcpy(okm_out.data(), t1.data(), okm_out.size());
+    } // <- prk's and t1's destructors (zeroing them) run here, right now.
 
     // `t1_input` only ever held public information (the info bytes) plus a
     // single non-secret counter byte, so this wipe is just defense in
-    // depth, not a secrecy requirement the way `prk`'s was.
+    // depth, not a secrecy requirement the way `prk`'s and `t1`'s were.
     SecureZero(t1_input.data(), t1_input.size());
 }
 
@@ -382,13 +392,13 @@ void DeriveWrappingKeyForWrap(
     ExtractRawSecretFromBCrypt(secret.get(), raw_secret);
     secret.reset(); // shared secret is highly sensitive; destroy immediately once extracted
 
-    // Step 6: HKDF-SHA256 over the raw shared secret, with the info string
+    // Step 6: HKDF-SHA512 over the raw shared secret, with the info string
     // binding it to both public keys (see BuildHkdfInfo above), writes the
     // final 32-byte wrapping key straight into the caller's
     // `wrapping_key_out` - this function never holds a second copy of the
     // final wrapping key itself.
     std::vector<uint8_t> info = BuildHkdfInfo(ephemeral_pub_out, kek_pub);
-    HkdfSha256(raw_secret.data(), raw_secret.size(), info, wrapping_key_out);
+    HkdfSha512(raw_secret.data(), raw_secret.size(), info, wrapping_key_out);
     // `raw_secret` (a SecureBuffer) is wiped automatically the instant this
     // function returns, immediately after the line above - its only use in
     // this whole function - since C++ runs a local variable's destructor
@@ -452,7 +462,7 @@ void DeriveWrappingKeyForUnwrap(
     // the byte-for-byte-identical raw shared secret is what guarantees both
     // sides derive the exact same wrapping key.
     std::vector<uint8_t> info = BuildHkdfInfo(ephemeral_pub, kek_pub);
-    HkdfSha256(raw_secret.data(), raw_secret.size(), info, wrapping_key_out);
+    HkdfSha512(raw_secret.data(), raw_secret.size(), info, wrapping_key_out);
     // As on the wrap side, `raw_secret` is wiped automatically here as the
     // function returns, immediately after its only use above.
 }
