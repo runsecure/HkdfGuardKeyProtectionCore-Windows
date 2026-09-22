@@ -11,14 +11,11 @@
 // way 0640 relies on for those two platforms, so the caller names one
 // explicitly here instead.
 //
-// The KEK's `service` identity is `<service-name>.<material-identifier>`:
-// the material identifier lets one logical service own up to 256 distinct
-// KEKs (e.g. for key rotation), each addressed by its own `service` string
-// under the hood.
+// The KEK's `service` identity is exactly --service-name's value, passed
+// straight through to hkdfguard_wrap_dek as `service`.
 //
 // Usage:
 //   hkdfguard-v1-initialize <key-file-path> \
-//       --material-identifier|-mi <1-256> \
 //       --service-name|-sn <name> \
 //       --dek|-d <base64> \
 //       --group|-g <name> \
@@ -68,8 +65,6 @@
 namespace {
 
 constexpr wchar_t kProgramName[] = L"hkdfguard-v1-initialize";
-constexpr long kMaterialIdentifierMin = 1;
-constexpr long kMaterialIdentifierMax = 256;
 constexpr size_t kDekLen = 32;
 // Generous starting capacity for the wrapped payload - retried once at the
 // library-reported size on HKDFGUARD_ERR_BUFFER_TOO_SMALL, so this only
@@ -142,7 +137,6 @@ private:
 
 struct Args {
     std::wstring keyFilePath;
-    long materialIdentifier = 0;
     std::wstring serviceName;
     std::wstring dekBase64;
     std::wstring groupName;
@@ -154,9 +148,9 @@ enum class ParseOutcome { Run, Help };
 void PrintUsage() {
     fwprintf(
         stderr,
-        L"Usage: %ls <key-file-path> --material-identifier|-mi <%ld-%ld> --service-name|-sn <name> "
+        L"Usage: %ls <key-file-path> --service-name|-sn <name> "
         L"--dek|-d <base64> --group|-g <name> [--force|-f]\n",
-        kProgramName, kMaterialIdentifierMin, kMaterialIdentifierMax);
+        kProgramName);
 }
 
 // Throws CliError on any parse failure; returns ParseOutcome::Help if
@@ -164,7 +158,6 @@ void PrintUsage() {
 // must check the return value before using `out`).
 ParseOutcome ParseArgs(int argc, wchar_t* argv[], Args& out) {
     std::optional<std::wstring> keyFilePath;
-    std::optional<long> materialIdentifier;
     std::optional<std::wstring> serviceName;
     std::optional<std::wstring> dekBase64;
     std::optional<std::wstring> groupName;
@@ -176,22 +169,6 @@ ParseOutcome ParseArgs(int argc, wchar_t* argv[], Args& out) {
             return ParseOutcome::Help;
         } else if (arg == L"--force" || arg == L"-f") {
             force = true;
-        } else if (arg == L"--material-identifier" || arg == L"-mi") {
-            if (i + 1 >= argc) {
-                throw CliError(arg + L" requires a value");
-            }
-            std::wstring value = argv[++i];
-            wchar_t* end = nullptr;
-            long parsed = wcstol(value.c_str(), &end, 10);
-            if (end == value.c_str() || *end != L'\0') {
-                throw CliError(L"--material-identifier must be an integer, got \"" + value + L"\"");
-            }
-            if (parsed < kMaterialIdentifierMin || parsed > kMaterialIdentifierMax) {
-                throw CliError(
-                    L"--material-identifier must be between " + std::to_wstring(kMaterialIdentifierMin) +
-                    L" and " + std::to_wstring(kMaterialIdentifierMax) + L", got " + std::to_wstring(parsed));
-            }
-            materialIdentifier = parsed;
         } else if (arg == L"--service-name" || arg == L"-sn") {
             if (i + 1 >= argc) {
                 throw CliError(arg + L" requires a value");
@@ -223,13 +200,11 @@ ParseOutcome ParseArgs(int argc, wchar_t* argv[], Args& out) {
     }
 
     if (!keyFilePath) throw CliError(L"missing required <key-file-path>");
-    if (!materialIdentifier) throw CliError(L"missing required --material-identifier|-mi");
     if (!serviceName) throw CliError(L"missing required --service-name|-sn");
     if (!dekBase64) throw CliError(L"missing required --dek|-d");
     if (!groupName) throw CliError(L"missing required --group|-g");
 
     out.keyFilePath = *keyFilePath;
-    out.materialIdentifier = *materialIdentifier;
     out.serviceName = *serviceName;
     out.dekBase64 = *dekBase64;
     out.groupName = *groupName;
@@ -319,13 +294,9 @@ std::vector<uint8_t> WrapDek(const std::string& service, const std::vector<BYTE>
     return wrapped;
 }
 
-// Enforces that the combined `<service-name>.<material-identifier>` string -
-// the exact value passed to hkdfguard_wrap_dek as `service` - contains only
-// ASCII alphanumeric characters or '.', matching this project's macOS/Linux
-// tools. The material identifier is already digits-only (see its parse in
-// ParseArgs), so in practice this only constrains --service-name, but it's
-// checked on the combined string to match exactly what gets passed to the
-// ABI call.
+// Enforces that --service-name - the exact value passed to
+// hkdfguard_wrap_dek as `service` - contains only ASCII alphanumeric
+// characters or '.', matching this project's macOS/Linux tools.
 void ValidateServiceCharset(const std::wstring& service) {
     for (wchar_t c : service) {
         bool isAsciiAlnum = (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
@@ -639,12 +610,9 @@ void Run(Args& args) {
 
     // `service` (and its UTF-8 form) is not secret -- it's a logical
     // identifier, not key material -- so both live for the rest of this
-    // function's scope, including the final status message below. This is
-    // computed before the DEK's own tightly-scoped block so that block can
-    // end the instant the DEK is no longer needed, without `service` also
-    // needing to be reconstructed afterward for the printf at the bottom.
-    std::wstring service = args.serviceName + L"." + std::to_wstring(args.materialIdentifier);
-    ValidateServiceCharset(service);
+    // function's scope, including the final status message below.
+    ValidateServiceCharset(args.serviceName);
+    const std::wstring& service = args.serviceName;
     std::string serviceUtf8 = ToUtf8(service);
 
     std::vector<uint8_t> wrapped;

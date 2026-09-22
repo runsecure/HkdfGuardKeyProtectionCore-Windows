@@ -119,9 +119,10 @@ Write-Section "CLI wrap + DLL unwrap round-trip verification"
 $verifyDir = Join-Path $RepoRoot "build\verify"
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
 $keyFile = Join-Path $verifyDir "verify.key"
-$serviceName = "hkdfguard-verify-script"
-$materialIdentifier = 1
-$service = "$serviceName.$materialIdentifier"
+# Alphanumeric only - hkdfguard-v1-initialize.exe's ValidateServiceCharset
+# rejects anything else (including hyphens) in --service-name.
+$serviceName = "hkdfguardverifyscript"
+$service = $serviceName
 
 # 32 cryptographically random bytes, base64-encoded for the CLI's --dek flag.
 $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -140,7 +141,7 @@ $dllDir = Split-Path -Parent $dllPath
 $oldPath = $env:PATH
 $env:PATH = "$dllDir;$env:PATH"
 try {
-    & $cliPath $keyFile --material-identifier $materialIdentifier --service-name $serviceName `
+    & $cliPath $keyFile --service-name $serviceName `
         --dek $dekBase64 --group $Group --force
     $cliExit = $LASTEXITCODE
 } finally {

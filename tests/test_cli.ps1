@@ -77,69 +77,57 @@ try {
 
     # ---- 3. Missing a required flag (--dek). ----
     $keyFile = Join-Path $workDir "missing-dek.key"
-    $r = Invoke-Cli @($keyFile, "--material-identifier", "1", "--service-name", "svc", "--group", "Users")
+    $r = Invoke-Cli @($keyFile, "--service-name", "svc", "--group", "Users")
     Check ($r.ExitCode -eq 2) "missing --dek exits 2"
 
     # ---- 4. An unrecognized argument. ----
     $r = Invoke-Cli @($keyFile, "--bogus-flag", "x")
     Check ($r.ExitCode -eq 2) "unrecognized argument exits 2"
 
-    # ---- 5/6/7. --material-identifier range/type validation (valid range is 1-256). ----
-    $r = Invoke-Cli @($keyFile, "--material-identifier", "0", "--service-name", "svc", "--dek", $validB64, "--group", "Users")
-    Check ($r.ExitCode -eq 2) "material-identifier 0 (below the 1-256 range) exits 2"
-
-    $r = Invoke-Cli @($keyFile, "--material-identifier", "257", "--service-name", "svc", "--dek", $validB64, "--group", "Users")
-    Check ($r.ExitCode -eq 2) "material-identifier 257 (above the 1-256 range) exits 2"
-
-    $r = Invoke-Cli @($keyFile, "--material-identifier", "abc", "--service-name", "svc", "--dek", $validB64, "--group", "Users")
-    Check ($r.ExitCode -eq 2) "non-numeric material-identifier exits 2"
-
-    # ---- 8. An unresolvable --group fails before any file is touched. ----
+    # ---- 5. An unresolvable --group fails before any file is touched. ----
     $bogusGroupKeyFile = Join-Path $workDir "bogus-group.key"
     $r = Invoke-Cli @(
-        $bogusGroupKeyFile, "--material-identifier", "1", "--service-name", "svc",
+        $bogusGroupKeyFile, "--service-name", "svc",
         "--dek", $validB64, "--group", "ThisGroupShouldNotExist12345")
     Check ($r.ExitCode -eq 1) "unresolvable --group exits 1"
     Check (-not (Test-Path $bogusGroupKeyFile)) "unresolvable --group does not create the key file"
 
-    # ---- 9. Invalid base64 in --dek. ----
+    # ---- 6. Invalid base64 in --dek. ----
     $badB64KeyFile = Join-Path $workDir "bad-b64.key"
     $r = Invoke-Cli @(
-        $badB64KeyFile, "--material-identifier", "1", "--service-name", "svc",
+        $badB64KeyFile, "--service-name", "svc",
         "--dek", "not-valid-base64!!!", "--group", "Users")
     Check ($r.ExitCode -eq 1) "invalid base64 --dek exits 1"
     Check (-not (Test-Path $badB64KeyFile)) "invalid base64 --dek does not create the key file"
 
-    # ---- 10. Valid base64 that decodes to the wrong length (16 bytes, not 32). ----
+    # ---- 7. Valid base64 that decodes to the wrong length (16 bytes, not 32). ----
     $wrongLenKeyFile = Join-Path $workDir "wrong-len.key"
     $shortB64 = [Convert]::ToBase64String((New-Object byte[] 16))
     $r = Invoke-Cli @(
-        $wrongLenKeyFile, "--material-identifier", "1", "--service-name", "svc",
+        $wrongLenKeyFile, "--service-name", "svc",
         "--dek", $shortB64, "--group", "Users")
     Check ($r.ExitCode -eq 1) "wrong-length decoded DEK exits 1"
     Check (-not (Test-Path $wrongLenKeyFile)) "wrong-length decoded DEK does not create the key file"
 
-    # ---- 11b. A --service-name containing a character other than an ASCII ----
-    #           alphanumeric or '.' is rejected (the combined
-    #           <service-name>.<material-identifier> string must match this
-    #           project's macOS/Linux tools' charset restriction).
+    # ---- 8. A --service-name containing a character other than an ASCII ----
+    #         alphanumeric or '.' is rejected.
     $badCharsetKeyFile = Join-Path $workDir "bad-charset.key"
     $r = Invoke-Cli @(
-        $badCharsetKeyFile, "--material-identifier", "1", "--service-name", "hkdfguard-cli-test",
+        $badCharsetKeyFile, "--service-name", "hkdfguard-cli-test",
         "--dek", $validB64, "--group", "Users")
     Check ($r.ExitCode -eq 1) "a service name containing a hyphen is rejected"
     Check (-not (Test-Path $badCharsetKeyFile)) "a rejected service name does not create the key file"
 
-    # ---- 11. An existing file without --force is left completely untouched. ----
+    # ---- 9. An existing file without --force is left completely untouched. ----
     $existingFile = Join-Path $workDir "existing.key"
     Set-Content -Path $existingFile -Value "pre-existing content" -NoNewline
     $r = Invoke-Cli @(
-        $existingFile, "--material-identifier", "1", "--service-name", "svc",
+        $existingFile, "--service-name", "svc",
         "--dek", $validB64, "--group", "Users")
     Check ($r.ExitCode -eq 1) "existing file without --force exits 1"
     Check ((Get-Content -Path $existingFile -Raw) -eq "pre-existing content") "existing file without --force is left untouched"
 
-    # ---- 12. Full wrap via the CLI, plus a --force overwrite - needs a real ----
+    # ---- 10. Full wrap via the CLI, plus a --force overwrite - needs a real ----
     #          machine-wide KEK, so only runs when elevated.
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
@@ -150,14 +138,13 @@ try {
         # rejected" scenario above; the CLI's ValidateServiceCharset would
         # reject a hyphenated name like the other tests' "hkdfguard-*" ones.
         $serviceName = "hkdfguardclitest"
-        $materialId = 1
 
         $dekBytes = New-Object byte[] 32
         [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes)
         $dekB64 = [Convert]::ToBase64String($dekBytes)
 
         $r = Invoke-Cli @(
-            $happyKeyFile, "--material-identifier", $materialId, "--service-name", $serviceName,
+            $happyKeyFile, "--service-name", $serviceName,
             "--dek", $dekB64, "--group", "Users", "--force")
         Check ($r.ExitCode -eq 0) "full wrap via the CLI succeeds (elevated)"
         if ($r.ExitCode -ne 0) {
@@ -175,7 +162,7 @@ try {
             [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes2)
             $dekB64_2 = [Convert]::ToBase64String($dekBytes2)
             $r2 = Invoke-Cli @(
-                $happyKeyFile, "--material-identifier", $materialId, "--service-name", $serviceName,
+                $happyKeyFile, "--service-name", $serviceName,
                 "--dek", $dekB64_2, "--group", "Users", "--force")
             Check ($r2.ExitCode -eq 0) "--force overwrites an existing wrapped-key file"
 
@@ -194,7 +181,7 @@ try {
         # tests/CMakeLists.txt), which isn't guaranteed to still resolve
         # ordinary system tools.
         if ($providerName) {
-            $keyName = "HkdfGuardWin_${serviceName}.${materialId}_v1"
+            $keyName = "HkdfGuardWin_${serviceName}_v1"
             $certutilPath = Join-Path $env:SystemRoot "System32\certutil.exe"
             & $certutilPath -csp $providerName -delkey $keyName | Out-Null
         }
