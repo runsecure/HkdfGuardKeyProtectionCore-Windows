@@ -7,7 +7,7 @@
     1. Locates the MSVC/CMake/Ninja toolchain from the Visual Studio Build
        Tools install and puts them on PATH for this process.
     2. Configures and builds the project (cmake -G Ninja).
-    3. Runs the project's own ctest suite (roundtrip + direct_aead).
+    3. Runs the project's own ctest suite (roundtrip).
     4. Generates a random 32-byte DEK, wraps it with the CLI tool
        (tools/hkdfguard-v1-initialize.exe), then independently unwraps the
        resulting file via a direct P/Invoke call into hkdfguard.dll's public
@@ -98,14 +98,14 @@ cmake --build build --config $Configuration
 if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
 Write-Ok "build succeeded"
 
-$dllPath = Join-Path $RepoRoot "build\HkdfGuard.Kms.P256Sha512AesGcm256.dll"
+$dllPath = Join-Path $RepoRoot "build\HkdfGuard.Kms.Windows.v1.dll"
 $cliPath = Join-Path $RepoRoot "build\tools\hkdfguard-v1-initialize.exe"
 foreach ($p in $dllPath, $cliPath) {
     if (-not (Test-Path $p)) { throw "expected build output missing: $p" }
 }
 
 # ---- ctest --------------------------------------------------------------
-Write-Section "Running ctest (roundtrip + direct_aead)"
+Write-Section "Running ctest (roundtrip)"
 ctest --test-dir build -C $Configuration --output-on-failure
 if ($LASTEXITCODE -eq 0) {
     Write-Ok "ctest: all tests passed"

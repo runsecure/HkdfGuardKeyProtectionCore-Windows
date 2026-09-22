@@ -21,7 +21,7 @@ needing to be the same account. If you need per-user isolation instead, that mea
 leaving `NCRYPT_MACHINE_KEY_FLAG` unset (current-user scope) - not offered as a build
 option here, since this project targets the shared-service deployment model above.
 
-The library exposes a small, stable C ABI (`include/hkdfguard.h`) with six functions.
+The library exposes a small, stable C ABI (`include/hkdfguard.h`) with three functions.
 No Windows handle, CNG/NCrypt type, or COM interface crosses that boundary, and no C++
 exception ever escapes it - every call returns an integer status code.
 
@@ -35,6 +35,10 @@ int32_t hkdfguard_unwrap_dek(
     const char* service,
     const uint8_t* wrapped, int32_t wrapped_len,
     uint8_t* out, int32_t* out_len);
+
+int32_t hkdfguard_generate_and_wrap_dek(
+    const char* service,
+    uint8_t* out, int32_t* out_len);
 ```
 
 `service` is a null-terminated UTF-8 string (non-empty, at most 128 bytes) identifying
@@ -47,61 +51,11 @@ wrap and unwrap a given payload, since it is not itself recorded in the wrapped 
 produced it - so callers can allocate output buffers without a size-query round trip.
 See `include/hkdfguard.h` for the full set of `HKDFGUARD_ERR_*` status codes.
 
-### Encrypting/decrypting data, not just the DEK
-
-Four more functions (`src/direct_aead.h`/`.cpp` for the crypto, wired up as ABI entry
-points in `src/hkdfguard.cpp`) cover the next step: actually using a DEK to protect
-data, not just wrapping the DEK itself.
-
-```c
-int32_t hkdfguard_encrypt(
-    uint8_t* key, int32_t key_len,
-    const uint8_t* plaintext, int32_t plaintext_len,
-    const uint8_t* aad, int32_t aad_len,
-    uint8_t* result, int32_t result_len);
-
-int32_t hkdfguard_decrypt(
-    uint8_t* key, int32_t key_len,
-    const uint8_t* ciphertext, int32_t ciphertext_len,
-    const uint8_t* aad, int32_t aad_len,
-    uint8_t* result, int32_t result_len);
-
-int32_t hkdfguard_encrypt_with_wrapped_dek(
-    const char* service,
-    const uint8_t* wrapped_dek, int32_t wrapped_dek_len,
-    const uint8_t* plaintext, int32_t plaintext_len,
-    const uint8_t* aad, int32_t aad_len,
-    uint8_t* result, int32_t result_len);
-
-int32_t hkdfguard_decrypt_with_wrapped_dek(
-    const char* service,
-    const uint8_t* wrapped_dek, int32_t wrapped_dek_len,
-    const uint8_t* ciphertext, int32_t ciphertext_len,
-    const uint8_t* aad, int32_t aad_len,
-    uint8_t* result, int32_t result_len);
-```
-
-`hkdfguard_encrypt`/`hkdfguard_decrypt` run AES-GCM directly under a caller-supplied
-key (`key_len` must be 16, 24, or 32 - AES-128/192/256), producing/consuming a
-`nonce || ciphertext || tag` payload (12-byte nonce, 16-byte tag - a fixed 28-byte
-overhead around the plaintext). The `_with_wrapped_dek` variants combine that with an
-`hkdfguard_unwrap_dek` call, so a caller holding only a *wrapped* DEK and a `service`
-string can do both in one call - the raw DEK never crosses back out to the caller in
-that path, and never leaves the DLL's process memory beyond the duration of that one
-call.
-
-These four use a different return convention than `hkdfguard_wrap_dek`/
-`hkdfguard_unwrap_dek` above: no `out_len` in/out parameter - a non-negative return is
-the number of bytes written to `result`, a negative return is one of the
-`HKDFGUARD_ERR_*` codes. `key` is not `const` in `hkdfguard_encrypt`/`hkdfguard_decrypt`:
-both zero it in place before returning, on every exit path except an invalid `key_len`.
-This mirrors the equivalent four functions in this project's macOS implementation
-function-for-function, including the wire payload layout. See the comment block above
-each declaration in `include/hkdfguard.h` for the exact contract, including a
-Windows-specific note on `hkdfguard_decrypt`: because the underlying `BCryptDecrypt`
-call can write unauthenticated plaintext into `result` even when it ultimately fails,
-`result` is zeroed on *any* decrypt failure - not just when something was actually
-written - the same policy `hkdfguard_unwrap_dek` already uses for the same reason.
+`hkdfguard_generate_and_wrap_dek` generates its own cryptographically random 32-byte DEK
+(via `BCryptGenRandom`) and wraps it in one call, for callers minting a brand new
+Ephemeral Data Protection Key - the plaintext DEK never crosses back out to the caller;
+it's zeroed internally the moment it's wrapped. Recover it later via
+`hkdfguard_unwrap_dek` on the resulting payload, with the same `service`.
 
 ## Building
 
@@ -114,31 +68,24 @@ cmake --build build --config Debug
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-**Run `ctest` from an elevated (Administrator) shell.** Both test executables wrap a
+**Run `ctest` from an elevated (Administrator) shell.** The test executable wraps a
 DEK, which creates a machine-wide KEK (`NCRYPT_MACHINE_KEY_FLAG`) on first use - see
 "Deployment model" above - and that creation step fails outright without elevation.
 This is a change from before this KEK became machine-scoped, when tests ran fine
 un-elevated.
 
-This produces `build/hkdfguard.dll` (+ `hkdfguard.lib` import library) and runs two
-test executables via `ctest`:
+This produces `build/hkdfguard.dll` (+ `hkdfguard.lib` import library) and runs one
+test executable via `ctest`:
 
 - `test_roundtrip` exercises: a basic wrap/unwrap roundtrip, KEK reuse across
   repeated calls, invalid-argument and buffer-too-small handling, that the output
-  buffer is zeroed on malformed-payload / authentication-failure paths, and that
+  buffer is zeroed on malformed-payload / authentication-failure paths, that
   different `service` names get independent KEKs (a payload wrapped under one
-  service cannot be unwrapped under another).
-- `test_direct_aead` exercises `hkdfguard_encrypt`/`hkdfguard_decrypt`/
-  `hkdfguard_encrypt_with_wrapped_dek`/`hkdfguard_decrypt_with_wrapped_dek`: a
-  round trip at all three AES key sizes (128/192/256), empty-plaintext and
-  no-AAD edge cases, that the key buffer is zeroed on every success/failure path
-  (except an invalid `key_len` itself), buffer-too-small handling, wrong-key/
-  tampered-ciphertext/wrong-AAD authentication failures (with `result` zeroed
-  afterward), null-pointer/negative-length argument validation, and the
-  wrapped-DEK chained functions' round trip plus their unwrap-stage failure
-  paths.
+  service cannot be unwrapped under another), and `hkdfguard_generate_and_wrap_dek`
+  (its own generated DEK round-trips through `hkdfguard_unwrap_dek`, two calls
+  produce independent DEKs, and its argument validation).
 
-Both test executables delete any KEKs they create once they finish (via an
+The test executable deletes any KEKs it creates once it finishes (via an
 internal, non-ABI helper in `kek_store.cpp`), so repeated runs don't accumulate
 persisted keys in the user's key storage.
 
@@ -174,18 +121,10 @@ verifying there before relying on it in production.
 - **Memory security**: `src/secure_buffer.h` (RAII `SecureZeroMemory` wrapper) and
   `src/handle_traits.h` (RAII closers for every NCrypt/BCrypt handle type) ensure key
   material and handles are wiped/closed on every exit path, including exceptions. All
-  six ABI entry points in `src/hkdfguard.cpp` catch every exception; `hkdfguard_unwrap_dek`
-  and `hkdfguard_decrypt` additionally zero the caller's output buffer on any failure
-  (both call into CNG functions - `BCryptDecrypt` - that can write unauthenticated
-  plaintext before reporting a tag mismatch), and `hkdfguard_encrypt`/`hkdfguard_decrypt`
-  zero the caller's key buffer on every exit path via a small RAII guard
-  (`KeyZeroGuard` in `src/hkdfguard.cpp`) once `key_len` has been validated.
-- **Direct AEAD**: `src/direct_aead.h`/`.cpp` implements AES-GCM encrypt/decrypt under
-  a caller-supplied key of any of the three standard sizes (128/192/256), with optional
-  additional authenticated data - kept separate from `src/aes_gcm.h`/`.cpp` (which only
-  ever seals a fixed 32-byte wrapping key with no AAD) rather than extending it in
-  place, matching the same separation this project's macOS and Linux implementations
-  use.
+  three ABI entry points in `src/hkdfguard.cpp` catch every exception; `hkdfguard_unwrap_dek`
+  additionally zeros the caller's output buffer on any failure (it calls into a CNG
+  function - `BCryptDecrypt` - that can write unauthenticated plaintext before reporting
+  a tag mismatch).
 
 ## Consuming from other languages
 
@@ -200,7 +139,7 @@ platform's standard FFI mechanism, e.g.:
   dynamic loading
 - **Node**: `ffi-napi`/`koffi`, or a native addon (N-API) linking `hkdfguard.lib`
 
-All five bindings map directly onto the six exported functions and the status codes in
+All five bindings map directly onto the three exported functions and the status codes in
 `include/hkdfguard.h`; none of them need to know anything about TPMs, CNG, or NCrypt.
 
 ## License

@@ -148,14 +148,66 @@ int main() {
     Check(rc == HKDFGUARD_OK, "second wrap succeeds");
     Check(wrapped2[1] == provider_type, "second wrap reuses the same provider type");
 
-    // ---- 3. Invalid dek_len. ----
+    // ---- 3. hkdfguard_generate_and_wrap_dek: generates its own DEK, wraps
+    //         it under the same KEK as the calls above, and never hands
+    //         the plaintext back. ----
+    std::vector<uint8_t> generated1(HKDFGUARD_WRAPPED_LEN);
+    int32_t generated1_len = static_cast<int32_t>(generated1.size());
+    rc = hkdfguard_generate_and_wrap_dek(kService, generated1.data(), &generated1_len);
+    Check(rc == HKDFGUARD_OK, "generate_and_wrap succeeds");
+    Check(generated1_len == HKDFGUARD_WRAPPED_LEN, "generate_and_wrap produces fixed-size payload");
+    Check(generated1[1] == provider_type, "generate_and_wrap reuses the same provider type");
+
+    // Unwrapping it recovers a real 32-byte DEK - proving the payload
+    // generate_and_wrap_dek produced is a genuine, independently unwrappable
+    // WrappedDekV1, not just a plausible-looking buffer.
+    std::vector<uint8_t> generated1_unwrapped(HKDFGUARD_DEK_LEN);
+    int32_t generated1_unwrapped_len = static_cast<int32_t>(generated1_unwrapped.size());
+    rc = hkdfguard_unwrap_dek(kService, generated1.data(), generated1_len, generated1_unwrapped.data(), &generated1_unwrapped_len);
+    Check(rc == HKDFGUARD_OK, "unwrap of a generate_and_wrap_dek payload succeeds");
+    Check(generated1_unwrapped_len == HKDFGUARD_DEK_LEN, "unwrap of a generate_and_wrap_dek payload produces 32-byte DEK");
+
+    // A second call generates an *independent* random DEK - not the fixed
+    // MakeDek() test vector, and not a repeat of the first call's DEK. This
+    // is the actual check that fresh randomness was sourced each time
+    // (rather than e.g. an all-zero or otherwise fixed buffer slipping
+    // through): with a 32-byte CSPRNG-sourced DEK, two calls producing the
+    // same bytes is astronomically unlikely, so any match indicates a real
+    // bug.
+    std::vector<uint8_t> generated2(HKDFGUARD_WRAPPED_LEN);
+    int32_t generated2_len = static_cast<int32_t>(generated2.size());
+    rc = hkdfguard_generate_and_wrap_dek(kService, generated2.data(), &generated2_len);
+    Check(rc == HKDFGUARD_OK, "second generate_and_wrap succeeds");
+    std::vector<uint8_t> generated2_unwrapped(HKDFGUARD_DEK_LEN);
+    int32_t generated2_unwrapped_len = static_cast<int32_t>(generated2_unwrapped.size());
+    rc = hkdfguard_unwrap_dek(kService, generated2.data(), generated2_len, generated2_unwrapped.data(), &generated2_unwrapped_len);
+    Check(rc == HKDFGUARD_OK, "unwrap of the second generate_and_wrap_dek payload succeeds");
+    Check(
+        std::memcmp(generated1_unwrapped.data(), generated2_unwrapped.data(), HKDFGUARD_DEK_LEN) != 0,
+        "two generate_and_wrap_dek calls produce different DEKs");
+    Check(
+        std::memcmp(dek.data(), generated1_unwrapped.data(), HKDFGUARD_DEK_LEN) != 0,
+        "generate_and_wrap_dek's DEK differs from the fixed test vector");
+
+    // ---- 4. generate_and_wrap_dek argument validation. ----
+    std::vector<uint8_t> gen_scratch(HKDFGUARD_WRAPPED_LEN);
+    int32_t gen_scratch_len = static_cast<int32_t>(gen_scratch.size());
+    rc = hkdfguard_generate_and_wrap_dek(nullptr, gen_scratch.data(), &gen_scratch_len);
+    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "generate_and_wrap rejects null service");
+
+    std::vector<uint8_t> gen_tiny_buf(HKDFGUARD_WRAPPED_LEN - 1);
+    int32_t gen_tiny_buf_len = static_cast<int32_t>(gen_tiny_buf.size());
+    rc = hkdfguard_generate_and_wrap_dek(kService, gen_tiny_buf.data(), &gen_tiny_buf_len);
+    Check(rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL, "generate_and_wrap rejects too-small output buffer");
+
+    // ---- 5. Invalid dek_len. ----
     int32_t bad_len = 16;
     std::vector<uint8_t> scratch(HKDFGUARD_WRAPPED_LEN);
     int32_t scratch_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(kService, dek.data(), bad_len, scratch.data(), &scratch_len);
     Check(rc == HKDFGUARD_ERR_INVALID_ARG, "wrap rejects wrong dek_len");
 
-    // ---- 4. Buffer too small on wrap. ----
+    // ---- 6. Buffer too small on wrap. ----
     // (Named `tiny_buf`/`tiny_out`, not `small`/`small_out`, because
     // <windows.h> - pulled in transitively through kek_store.h - #defines
     // the plain identifier `small` as a legacy MIDL type; using it as a
@@ -165,13 +217,13 @@ int main() {
     rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), tiny_buf.data(), &tiny_buf_len);
     Check(rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL, "wrap rejects too-small output buffer");
 
-    // ---- 5. Buffer too small on unwrap. ----
+    // ---- 7. Buffer too small on unwrap. ----
     std::vector<uint8_t> tiny_out(HKDFGUARD_DEK_LEN - 1);
     int32_t tiny_out_len = static_cast<int32_t>(tiny_out.size());
     rc = hkdfguard_unwrap_dek(kService, wrapped.data(), wrapped_len, tiny_out.data(), &tiny_out_len);
     Check(rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL, "unwrap rejects too-small output buffer");
 
-    // ---- 6. Malformed payload (truncated). ----
+    // ---- 8. Malformed payload (truncated). ----
     // `std::vector<uint8_t> truncated(wrapped.begin(), wrapped.begin() +
     // wrapped_len - 1)` builds a *new* vector from a range of `wrapped`'s
     // elements - here, every element except the last one - using the
@@ -190,7 +242,7 @@ int main() {
     Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects truncated payload");
     Check(AllZero(out_for_malformed.data(), out_for_malformed.size()), "output buffer zeroed after malformed payload");
 
-    // ---- 7. Corrupted ciphertext -> authentication failure, output zeroed. ----
+    // ---- 9. Corrupted ciphertext -> authentication failure, output zeroed. ----
     // `std::vector<uint8_t> corrupted = wrapped;` copies the whole vector
     // (std::vector's copy constructor, unlike SecureBuffer's, is not
     // deleted - it's perfectly fine to copy plain wrapped-payload bytes,
@@ -208,7 +260,7 @@ int main() {
     Check(rc == HKDFGUARD_ERR_AUTH_FAILED, "unwrap rejects corrupted ciphertext");
     Check(AllZero(out_for_auth.data(), out_for_auth.size()), "output buffer zeroed after auth failure");
 
-    // ---- 8. Corrupted tag -> authentication failure, output zeroed. ----
+    // ---- 10. Corrupted tag -> authentication failure, output zeroed. ----
     std::vector<uint8_t> corrupted_tag = wrapped;
     corrupted_tag[wrapped_len - 1] ^= 0xFF; // inside the tag region (the payload's very last byte)
     std::vector<uint8_t> out_for_tag(HKDFGUARD_DEK_LEN, 0xAA);
@@ -218,7 +270,7 @@ int main() {
     Check(rc == HKDFGUARD_ERR_AUTH_FAILED, "unwrap rejects corrupted tag");
     Check(AllZero(out_for_tag.data(), out_for_tag.size()), "output buffer zeroed after tag failure");
 
-    // ---- 9. Invalid service (null / empty) is rejected. ----
+    // ---- 11. Invalid service (null / empty) is rejected. ----
     int32_t null_service_out_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(nullptr, dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &null_service_out_len);
     Check(rc == HKDFGUARD_ERR_INVALID_ARG, "wrap rejects null service");
@@ -230,7 +282,7 @@ int main() {
     rc = hkdfguard_wrap_dek("", dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &empty_service_out_len);
     Check(rc == HKDFGUARD_ERR_INVALID_ARG, "wrap rejects empty service");
 
-    // ---- 10. A different service gets its own independent KEK, and a ----
+    // ---- 12. A different service gets its own independent KEK, and a ----
     //          payload wrapped under one service cannot be unwrapped under
     //          another.
     bool other_service_wrapped = false;

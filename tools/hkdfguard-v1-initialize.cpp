@@ -319,6 +319,23 @@ std::vector<uint8_t> WrapDek(const std::string& service, const std::vector<BYTE>
     return wrapped;
 }
 
+// Enforces that the combined `<service-name>.<material-identifier>` string -
+// the exact value passed to hkdfguard_wrap_dek as `service` - contains only
+// ASCII alphanumeric characters or '.', matching this project's macOS/Linux
+// tools. The material identifier is already digits-only (see its parse in
+// ParseArgs), so in practice this only constrains --service-name, but it's
+// checked on the combined string to match exactly what gets passed to the
+// ABI call.
+void ValidateServiceCharset(const std::wstring& service) {
+    for (wchar_t c : service) {
+        bool isAsciiAlnum = (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
+        if (!isAsciiAlnum && c != L'.') {
+            throw CliError(
+                L"combined service name \"" + service + L"\" must contain only alphanumeric characters or '.'");
+        }
+    }
+}
+
 // MARK: - Security descriptor: owner read/write, one named group read-only
 
 // Fetches the current process token's owner SID (TokenOwner) - the SID
@@ -627,6 +644,7 @@ void Run(Args& args) {
     // end the instant the DEK is no longer needed, without `service` also
     // needing to be reconstructed afterward for the printf at the bottom.
     std::wstring service = args.serviceName + L"." + std::to_wstring(args.materialIdentifier);
+    ValidateServiceCharset(service);
     std::string serviceUtf8 = ToUtf8(service);
 
     std::vector<uint8_t> wrapped;

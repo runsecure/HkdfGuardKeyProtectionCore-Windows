@@ -24,7 +24,7 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 
 # Declares the "hkdfguard" build target: a SHARED library (a .dll on
 # Windows, plus a companion .lib "import library" other code links against
-# to call into it), built from exactly these six .cpp files. Each .cpp's
+# to call into it), built from exactly these five .cpp files. Each .cpp's
 # own #include of its matching .h pulls the rest of the source tree in as
 # needed - CMake itself doesn't need to know about the .h files here.
 add_library(hkdfguard SHARED
@@ -33,18 +33,17 @@ add_library(hkdfguard SHARED
     src/kek_store.cpp
     src/ecdh_hkdf.cpp
     src/aes_gcm.cpp
-    src/direct_aead.cpp
 )
 
 # Names the actual output files (the .dll and its companion .lib import
-# library) after the specific KMS "suite" this build implements - the
-# (Key Encapsulation, Hash, symmetric cipher) recipe used for DEK
-# wrap/unwrap: ECDH P-256 + HKDF-SHA512 + AES-256-GCM. Only changes what
-# lands on disk - the CMake target itself is still named "hkdfguard"
-# everywhere else in this file and in tests/CMakeLists.txt (e.g.
-# target_link_libraries, $<TARGET_FILE_DIR:hkdfguard>), so nothing else
-# needs to change when this name does.
-set_target_properties(hkdfguard PROPERTIES OUTPUT_NAME "HkdfGuard.Kms.P256Sha512AesGcm256")
+# library) after this platform and the wire-format/wrap-protocol version
+# they implement, matching the same HkdfGuard.Kms.<platform>.v1 naming
+# convention this project's macOS and Linux build outputs use. Only
+# changes what lands on disk - the CMake target itself is still named
+# "hkdfguard" everywhere else in this file and in tests/CMakeLists.txt
+# (e.g. target_link_libraries, $<TARGET_FILE_DIR:hkdfguard>), so nothing
+# else needs to change when this name does.
+set_target_properties(hkdfguard PROPERTIES OUTPUT_NAME "HkdfGuard.Kms.Windows.v1")
 
 # PRIVATE compile definitions apply only while compiling hkdfguard's own
 # .cpp files, not to anything that later links against it. HKDFGUARD_EXPORTS
