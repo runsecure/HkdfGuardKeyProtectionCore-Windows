@@ -106,3 +106,6 @@ Thumbs.db
 ehthumbs.db
 desktop.ini
 $RECYCLE.BIN/
+
+# Distribution Folder
+dist/

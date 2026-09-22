@@ -22,6 +22,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # hand-picking a minimal, stable ABI surface.
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 
+# Statically link the MSVC/UCRT runtime (/MT, /MTd for Debug) into every
+# binary this project produces, instead of the CMake/MSVC default of
+# dynamically linking it (/MD, /MDd). Without this, hkdfguard.dll and
+# hkdfguard-v1-initialize.exe depend on MSVCP140.dll/VCRUNTIME140*.dll/the
+# api-ms-win-crt-*.dll forwarders at load time, none of which ship with a
+# bare Windows install - a machine without the Visual C++ Redistributable
+# (or Visual Studio itself) installed fails to load them. Statically linking
+# instead makes both fully self-contained: nothing beyond the OS itself is
+# required on a target machine. Must be set before any target is declared
+# below (it configures a global default new targets pick up); relies on
+# CMake policy CMP0091 defaulting to NEW, which it does automatically here
+# since cmake_minimum_required's version (3.20) is well past 3.15, the
+# version that introduced it.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # Declares the "hkdfguard" build target: a SHARED library (a .dll on
 # Windows, plus a companion .lib "import library" other code links against
 # to call into it), built from exactly these five .cpp files. Each .cpp's
