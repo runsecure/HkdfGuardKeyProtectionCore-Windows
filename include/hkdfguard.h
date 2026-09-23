@@ -57,8 +57,8 @@ extern "C" {
  * HkdfGuardWin - Windows-native DEK wrapper.
  *
  * Wraps and unwraps a 32-byte Data Encryption Key (DEK) using a persistent,
- * user-scoped, non-exportable P-256 Key Encryption Key (KEK) held by the
- * Microsoft Platform Crypto Provider (TPM/vTPM) when available, or the
+ * machine-wide-scoped, non-exportable P-256 Key Encryption Key (KEK) held by
+ * the Microsoft Platform Crypto Provider (TPM/vTPM) when available, or the
  * Microsoft Software Key Storage Provider otherwise. All Windows-specific
  * details (CNG/NCrypt handles, COM, provider selection) are fully contained
  * behind this ABI. No exception ever crosses this boundary; every function
@@ -145,6 +145,30 @@ HKDFGUARD_API int32_t hkdfguard_wrap_dek(
 HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
     const char* service,
     const uint8_t* wrapped, int32_t wrapped_len,
+    uint8_t* out, int32_t* out_len);
+
+/*
+ * Generates a fresh, cryptographically random 32-byte DEK and immediately
+ * wraps it under the persistent KEK identified by `service`, in one call -
+ * for callers that want a brand new Ephemeral Data Protection Key without
+ * having to source their own randomness.
+ *
+ * The newly generated plaintext DEK never crosses this ABI boundary: it is
+ * zeroed internally the instant it has been wrapped, before this function
+ * returns. To recover it later, unwrap the resulting payload via
+ * hkdfguard_unwrap_dek, passing the same `service`.
+ *
+ * service   - see hkdfguard_wrap_dek.
+ * out       - caller-owned output buffer.
+ * out_len   - in: capacity of out, in bytes.
+ *             out: on success, the number of bytes written (always
+ *             HKDFGUARD_WRAPPED_LEN).
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ * On failure, no partial output is left in the caller's buffer.
+ */
+HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
+    const char* service,
     uint8_t* out, int32_t* out_len);
 
 // Closes the extern "C" block opened above.

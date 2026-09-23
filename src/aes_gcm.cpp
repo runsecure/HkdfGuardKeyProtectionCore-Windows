@@ -102,6 +102,7 @@ ScopedBCryptKey OpenAesKey(ScopedBCryptAlg& alg, const uint8_t key[32]) {
 void AesGcmEncrypt(
     const uint8_t key[32],
     const uint8_t* plaintext, unsigned long plaintext_len,
+    const uint8_t* aad, unsigned long aad_len,
     uint8_t nonce_out[kNonceLen],
     uint8_t* ciphertext_out,
     uint8_t tag_out[kTagLen]) {
@@ -143,6 +144,12 @@ void AesGcmEncrypt(
     // once encryption finishes.
     auth_info.pbTag = tag_out;
     auth_info.cbTag = static_cast<ULONG>(kTagLen);
+    // ...and the additional authenticated data (the caller's `service`
+    // string, per hkdfguard.cpp's call site) to bind into the tag without
+    // encrypting it. CNG accepts null/0 here for "no AAD" just as readily
+    // as a real buffer.
+    auth_info.pbAuthData = const_cast<PUCHAR>(aad);
+    auth_info.cbAuthData = aad_len;
 
     // `result_len` is another in/out-style parameter: BCryptEncrypt writes
     // the actual number of bytes it produced into it, which we then check
@@ -172,6 +179,7 @@ void AesGcmDecrypt(
     const uint8_t key[32],
     const uint8_t nonce[kNonceLen],
     const uint8_t* ciphertext, unsigned long ciphertext_len,
+    const uint8_t* aad, unsigned long aad_len,
     const uint8_t tag[kTagLen],
     uint8_t* plaintext_out) {
     ScopedBCryptAlg alg;
@@ -179,17 +187,23 @@ void AesGcmDecrypt(
 
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO auth_info;
     BCRYPT_INIT_AUTH_MODE_INFO(auth_info);
-    // On the decrypt side, the nonce and tag are *inputs* CNG reads (the
-    // ones that were produced by AesGcmEncrypt and travelled along with the
-    // ciphertext in the wrapped payload) rather than outputs it writes, so
-    // `const_cast` strips the const-ness here purely because
+    // On the decrypt side, the nonce, tag, and AAD are *inputs* CNG reads
+    // (the ones that were produced by AesGcmEncrypt and travelled along
+    // with the ciphertext in the wrapped payload, or supplied fresh by the
+    // caller for AAD) rather than outputs it writes, so `const_cast`
+    // strips the const-ness here purely because
     // BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO's fields are typed as
     // non-const `PUCHAR` even when used for input-only data - CNG itself
-    // does not write through these two pointers during a decrypt.
+    // does not write through these three pointers during a decrypt.
     auth_info.pbNonce = const_cast<PUCHAR>(nonce);
     auth_info.cbNonce = static_cast<ULONG>(kNonceLen);
     auth_info.pbTag = const_cast<PUCHAR>(tag);
     auth_info.cbTag = static_cast<ULONG>(kTagLen);
+    // Must match the AAD used in AesGcmEncrypt, or CNG reports an
+    // authentication failure below (STATUS_AUTH_TAG_MISMATCH), same as any
+    // other tamper.
+    auth_info.pbAuthData = const_cast<PUCHAR>(aad);
+    auth_info.cbAuthData = aad_len;
 
     ULONG result_len = 0;
     NTSTATUS status = BCryptDecrypt(

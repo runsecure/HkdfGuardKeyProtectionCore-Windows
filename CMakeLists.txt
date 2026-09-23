@@ -22,6 +22,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # hand-picking a minimal, stable ABI surface.
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 
+# Statically link the MSVC/UCRT runtime (/MT, /MTd for Debug) into every
+# binary this project produces, instead of the CMake/MSVC default of
+# dynamically linking it (/MD, /MDd). Without this, hkdfguard.dll and
+# hkdfguard-v1-initialize.exe depend on MSVCP140.dll/VCRUNTIME140*.dll/the
+# api-ms-win-crt-*.dll forwarders at load time, none of which ship with a
+# bare Windows install - a machine without the Visual C++ Redistributable
+# (or Visual Studio itself) installed fails to load them. Statically linking
+# instead makes both fully self-contained: nothing beyond the OS itself is
+# required on a target machine. Must be set before any target is declared
+# below (it configures a global default new targets pick up); relies on
+# CMake policy CMP0091 defaulting to NEW, which it does automatically here
+# since cmake_minimum_required's version (3.20) is well past 3.15, the
+# version that introduced it.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # Declares the "hkdfguard" build target: a SHARED library (a .dll on
 # Windows, plus a companion .lib "import library" other code links against
 # to call into it), built from exactly these five .cpp files. Each .cpp's
@@ -34,6 +51,16 @@ add_library(hkdfguard SHARED
     src/ecdh_hkdf.cpp
     src/aes_gcm.cpp
 )
+
+# Names the actual output files (the .dll and its companion .lib import
+# library) after this platform and the wire-format/wrap-protocol version
+# they implement, matching the same HkdfGuard.Kms.<platform>.v1 naming
+# convention this project's macOS and Linux build outputs use. Only
+# changes what lands on disk - the CMake target itself is still named
+# "hkdfguard" everywhere else in this file and in tests/CMakeLists.txt
+# (e.g. target_link_libraries, $<TARGET_FILE_DIR:hkdfguard>), so nothing
+# else needs to change when this name does.
+set_target_properties(hkdfguard PROPERTIES OUTPUT_NAME "HkdfGuard.Kms.Windows.v1")
 
 # PRIVATE compile definitions apply only while compiling hkdfguard's own
 # .cpp files, not to anything that later links against it. HKDFGUARD_EXPORTS
@@ -69,6 +96,11 @@ if(MSVC)
     target_compile_options(hkdfguard PRIVATE /W4 /guard:cf /GS)
     target_link_options(hkdfguard PRIVATE /GUARD:CF)
 endif()
+
+# tools/CMakeLists.txt declares hkdfguard-v1-initialize, the standalone CLI
+# utility that wraps a DEK and writes it to a file - see that file for why
+# it's a separate add_subdirectory rather than folded into this one.
+add_subdirectory(tools)
 
 # Turns on CTest support (the `ctest` command used in README.md) and pulls
 # in tests/CMakeLists.txt, which declares the test_roundtrip executable and

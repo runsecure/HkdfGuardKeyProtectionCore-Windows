@@ -11,7 +11,7 @@ namespace hkdfguard {
 // exports the KEK's public key from `kek_key` (always permitted for ECC
 // regardless of export policy), performs ECDH entirely in software (the KEK
 // private key/TPM is never touched - only its public part is needed), and
-// derives a 32-byte AES wrapping key via HKDF-SHA256. Writes the ephemeral
+// derives a 32-byte AES wrapping key via HKDF-SHA512. Writes the ephemeral
 // public key bytes (64 bytes, raw X||Y) into `ephemeral_pub_out` for
 // inclusion in the wrapped payload. The ECDH shared secret and all
 // intermediate buffers are destroyed/zeroized before returning.
@@ -31,7 +31,7 @@ void DeriveWrappingKeyForWrap(
 // Unwrap-side key agreement: imports the payload's ephemeral public key,
 // performs ECDH against the persistent KEK's private key (`kek_key`, opened
 // on `provider` - this is the step that may execute inside a TPM/vTPM), and
-// derives the 32-byte AES wrapping key via HKDF-SHA256 using the same
+// derives the 32-byte AES wrapping key via HKDF-SHA512 using the same
 // construction as the wrap side. The ECDH shared secret and all
 // intermediate buffers are destroyed/zeroized before returning.
 void DeriveWrappingKeyForUnwrap(

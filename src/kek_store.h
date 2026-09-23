@@ -35,9 +35,15 @@ struct ResolvedKek {
 // Crypto Provider (TPM/vTPM) first, opening the existing persisted key or
 // creating it if absent; if that provider is unavailable or fails for any
 // reason, falls back to the Microsoft Software Key Storage Provider with the
-// same open-or-create logic. The KEK is current-user scoped and
-// non-exportable. Throws HkdfGuardError(HKDFGUARD_ERR_PROVIDER) if both
-// providers fail.
+// same open-or-create logic. The KEK is machine-wide scoped (via
+// NCRYPT_MACHINE_KEY_FLAG - see kek_store.cpp) and non-exportable: it is
+// not tied to the calling account, so a different account than the one
+// that created it can later open and use it (subject to the key's ACL).
+// Creating a new machine-wide key requires the calling process to be
+// elevated; this is the intended shape for a deployment-time utility that
+// wraps a DEK once, ahead of a separate, lower-privileged account
+// unwrapping it later. Throws HkdfGuardError(HKDFGUARD_ERR_PROVIDER) if
+// both providers fail.
 //
 // `const std::wstring& service` - a *reference* to a std::wstring (C++'s
 // "wide string" type, holding UTF-16 characters, which is what every
@@ -50,9 +56,11 @@ ResolvedKek ResolveOrCreateKekForWrap(const std::wstring& service);
 // Opens the specific KEK identified by `service` and a wrapped payload's
 // provider_type and key_id, for use during unwrap. Never creates a key.
 // Throws HkdfGuardError(HKDFGUARD_ERR_PROVIDER) if the provider or key
-// cannot be opened (e.g. the KEK was created under a different user
-// profile, a different service name, or on a TPM that is no longer
-// available).
+// cannot be opened (e.g. a different service name, a different machine, or
+// a TPM that is no longer available). Since the KEK is machine-wide
+// scoped, this succeeds for any local account the key's ACL permits -
+// unlike a per-user key, it does not need to be the same account that
+// originally wrapped the DEK.
 ResolvedKek OpenKekForUnwrap(const std::wstring& service, uint8_t provider_type, uint32_t key_id);
 
 // Deletes the persisted KEK identified by `service`/`provider_type`/

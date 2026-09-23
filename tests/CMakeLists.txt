@@ -37,3 +37,23 @@ add_test(NAME roundtrip COMMAND test_roundtrip)
 set_tests_properties(roundtrip PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>;$ENV{PATH}"
 )
+
+# test_cli.ps1 exercises hkdfguard-v1-initialize.exe's own argument parsing,
+# validation, and file-handling behavior - none of which test_roundtrip
+# covers, since that only calls into hkdfguard.dll directly and never spawns
+# the CLI. Registered as an ordinary ctest test whose "command" happens to be
+# powershell.exe running a script, the same way any other test executable
+# would be; $<TARGET_FILE:hkdfguard-v1-initialize> resolves to the CLI's real
+# built path (whatever it ends up being for the chosen generator/config),
+# passed as that script's -CliExePath argument. hkdfguard-v1-initialize.exe
+# needs hkdfguard.dll to be findable too (same reason as roundtrip/
+# direct_aead above), so this test gets the identical PATH treatment.
+add_test(
+    NAME cli
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/test_cli.ps1"
+            -CliExePath "$<TARGET_FILE:hkdfguard-v1-initialize>"
+)
+set_tests_properties(cli PROPERTIES
+    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>;$ENV{PATH}"
+)

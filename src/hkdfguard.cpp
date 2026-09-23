@@ -13,8 +13,11 @@
 #include "wire_format.h"
 
 // windows.h: MultiByteToWideChar, CP_UTF8, MB_ERR_INVALID_CHARS (used by
-// ValidateAndConvertService below). cstring: strnlen. string: std::wstring.
+// ValidateAndConvertService below). bcrypt.h: BCryptGenRandom (used by
+// hkdfguard_generate_and_wrap_dek below to source the new DEK's
+// randomness). cstring: strnlen, memcpy. string: std::wstring.
 #include <windows.h>
+#include <bcrypt.h>
 #include <cstring>
 #include <string>
 
@@ -79,6 +82,87 @@ std::wstring ValidateAndConvertService(const char* service) {
     return wide;
 }
 
+// The actual wrap orchestration shared by hkdfguard_wrap_dek (wraps a
+// caller-supplied DEK) and hkdfguard_generate_and_wrap_dek (wraps a freshly
+// generated one) - factored out here so this crypto sequence exists in
+// exactly one place rather than being duplicated between the two ABI entry
+// points below. Callers are responsible for catching whatever this throws;
+// it does not itself touch the ABI's integer-status-code convention.
+int32_t WrapDekCore(const char* service, const uint8_t* dek, int32_t dek_len, uint8_t* out, int32_t* out_len) {
+    // Basic null-pointer validation before touching any of the pointers.
+    // `dek_len`/`out_len` themselves are validated next.
+    if (dek == nullptr || out == nullptr || out_len == nullptr) {
+        return HKDFGUARD_ERR_INVALID_ARG;
+    }
+    if (dek_len != HKDFGUARD_DEK_LEN) {
+        return HKDFGUARD_ERR_INVALID_ARG;
+    }
+    // `*out_len` dereferences the pointer to read the caller-supplied
+    // buffer capacity (the "in" half of this in/out parameter - see
+    // hkdfguard.h's note on this pattern). Checked before doing any real
+    // work, so a too-small buffer fails fast.
+    if (*out_len < HKDFGUARD_WRAPPED_LEN) {
+        return HKDFGUARD_ERR_BUFFER_TOO_SMALL;
+    }
+
+    std::wstring service_name = ValidateAndConvertService(service);
+
+    // Resolve (create if necessary) this service's machine-wide persistent
+    // KEK, preferring the TPM/vTPM-backed Platform Crypto Provider and
+    // falling back to the Software Key Storage Provider automatically.
+    // Creating it for the first time requires this process to be elevated
+    // (see kek_store.h/.cpp) - by design, for a deployment-time wrap step
+    // ahead of a separate account unwrapping later.
+    ResolvedKek kek = ResolveOrCreateKekForWrap(service_name);
+
+    // Ephemeral ECDH + HKDF-SHA512 -> 32-byte AES wrapping key. Only the
+    // KEK's public key is needed here, so this never touches the TPM.
+    uint8_t ephemeral_pub[kEphemeralPubLen];
+    // `nonce`/`ciphertext`/`tag` are declared here, *outside* the nested
+    // block below, because they're needed again afterward (by
+    // SerializeWrappedDek) - none of the three is secret (they're all meant
+    // to become part of the public wrapped payload), so there's no reason
+    // to scope them any more tightly than that.
+    uint8_t nonce[kNonceLen];
+    uint8_t ciphertext[kCiphertextLen];
+    uint8_t tag[kTagLen];
+    {
+        // `wrapping_key` - the actual AES-256 key material derived for this
+        // one wrap call - is deliberately declared inside this nested
+        // `{ ... }` block rather than alongside the buffers above, and used
+        // for nothing outside of it. That means its destructor
+        // (SecureBuffer's SecureZeroMemory wipe - see secure_buffer.h)
+        // fires the instant this block ends, i.e. immediately after
+        // AesGcmEncrypt's done with it, rather than only at the end of the
+        // whole function (which would otherwise leave it sitting around,
+        // unused but unwiped, for the length of SerializeWrappedDek and the
+        // `return` below). This is the same "shrink the scope to shrink
+        // the lifetime" technique used for `prk` inside ecdh_hkdf.cpp's
+        // HkdfSha512.
+        SecureBuffer<32> wrapping_key;
+        DeriveWrappingKeyForWrap(kek.key.get(), ephemeral_pub, wrapping_key);
+
+        // AES-256-GCM directly from the caller's dek pointer - no
+        // intermediate plaintext staging buffer. AAD is the caller's
+        // `service` string itself (raw UTF-8 bytes, not the wide
+        // NCrypt-key-name form `service_name` above): binds this
+        // ciphertext to the exact service it was wrapped for, matching
+        // this project's macOS and Linux implementations, which use the
+        // identical AAD for the identical reason.
+        AesGcmEncrypt(
+            wrapping_key.data(), dek, static_cast<unsigned long>(dek_len),
+            reinterpret_cast<const uint8_t*>(service), static_cast<unsigned long>(strlen(service)),
+            nonce, ciphertext, tag);
+    } // <- wrapping_key's destructor (zeroing it) runs here, right now.
+
+    // Assemble the final 132-byte payload directly into the caller's
+    // buffer, and report how many bytes were written back through the
+    // out-parameter.
+    SerializeWrappedDek(kek.provider_type, kek.key_id, ephemeral_pub, nonce, ciphertext, tag, out);
+    *out_len = static_cast<int32_t>(kTotalLen);
+    return HKDFGUARD_OK;
+}
+
 } // namespace
 
 // `extern "C"` here (repeated at each function, rather than wrapping both
@@ -94,79 +178,18 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
     const uint8_t* dek, int32_t dek_len,
     uint8_t* out, int32_t* out_len) {
     // The entire body lives inside one `try` block: this is what makes it
-    // possible for every internal helper (ValidateAndConvertService,
-    // ResolveOrCreateKekForWrap, DeriveWrappingKeyForWrap, AesGcmEncrypt,
-    // ...) to simply `throw HkdfGuardError(...)` the moment something goes
-    // wrong, instead of every one of them returning a code that this
-    // function would otherwise have to check after every single call. Two
-    // `catch` clauses below turn whatever came out of the `try` block back
-    // into a plain `int32_t` for the ABI - which is the one and only place
-    // in this whole codebase a C++ exception is allowed to stop, per the
-    // "no exception crosses the ABI" requirement.
+    // possible for every internal helper WrapDekCore calls
+    // (ValidateAndConvertService, ResolveOrCreateKekForWrap,
+    // DeriveWrappingKeyForWrap, AesGcmEncrypt, ...) to simply `throw
+    // HkdfGuardError(...)` the moment something goes wrong, instead of
+    // every one of them returning a code that this function would
+    // otherwise have to check after every single call. Two `catch` clauses
+    // below turn whatever came out of the `try` block back into a plain
+    // `int32_t` for the ABI - which is the one and only place in this
+    // whole codebase a C++ exception is allowed to stop, per the "no
+    // exception crosses the ABI" requirement.
     try {
-        // Basic null-pointer validation before touching any of the
-        // pointers. `dek_len`/`out_len` themselves are validated next.
-        if (dek == nullptr || out == nullptr || out_len == nullptr) {
-            return HKDFGUARD_ERR_INVALID_ARG;
-        }
-        if (dek_len != HKDFGUARD_DEK_LEN) {
-            return HKDFGUARD_ERR_INVALID_ARG;
-        }
-        // `*out_len` dereferences the pointer to read the caller-supplied
-        // buffer capacity (the "in" half of this in/out parameter - see
-        // hkdfguard.h's note on this pattern). Checked before doing any
-        // real work, so a too-small buffer fails fast.
-        if (*out_len < HKDFGUARD_WRAPPED_LEN) {
-            return HKDFGUARD_ERR_BUFFER_TOO_SMALL;
-        }
-
-        std::wstring service_name = ValidateAndConvertService(service);
-
-        // Resolve (create if necessary) the current user's persistent KEK
-        // for this service, preferring the TPM/vTPM-backed Platform Crypto
-        // Provider and falling back to the Software Key Storage Provider
-        // automatically.
-        ResolvedKek kek = ResolveOrCreateKekForWrap(service_name);
-
-        // Ephemeral ECDH + HKDF-SHA256 -> 32-byte AES wrapping key. Only the
-        // KEK's public key is needed here, so this never touches the TPM.
-        uint8_t ephemeral_pub[kEphemeralPubLen];
-        // `nonce`/`ciphertext`/`tag` are declared here, *outside* the nested
-        // block below, because they're needed again afterward (by
-        // SerializeWrappedDek) - none of the three is secret (they're all
-        // meant to become part of the public wrapped payload), so there's
-        // no reason to scope them any more tightly than that.
-        uint8_t nonce[kNonceLen];
-        uint8_t ciphertext[kCiphertextLen];
-        uint8_t tag[kTagLen];
-        {
-            // `wrapping_key` - the actual AES-256 key material derived for
-            // this one wrap call - is deliberately declared inside this
-            // nested `{ ... }` block rather than alongside the buffers
-            // above, and used for nothing outside of it. That means its
-            // destructor (SecureBuffer's SecureZeroMemory wipe - see
-            // secure_buffer.h) fires the instant this block ends, i.e.
-            // immediately after AesGcmEncrypt's done with it, rather than
-            // only at the end of the whole hkdfguard_wrap_dek function
-            // (which would otherwise leave it sitting around, unused but
-            // unwiped, for the length of SerializeWrappedDek and the
-            // `return` below). This is the same "shrink the scope to
-            // shrink the lifetime" technique used for `prk` inside
-            // ecdh_hkdf.cpp's HkdfSha256.
-            SecureBuffer<32> wrapping_key;
-            DeriveWrappingKeyForWrap(kek.key.get(), ephemeral_pub, wrapping_key);
-
-            // AES-256-GCM directly from the caller's dek pointer - no
-            // intermediate plaintext staging buffer.
-            AesGcmEncrypt(wrapping_key.data(), dek, static_cast<unsigned long>(dek_len), nonce, ciphertext, tag);
-        } // <- wrapping_key's destructor (zeroing it) runs here, right now.
-
-        // Assemble the final 132-byte payload directly into the caller's
-        // buffer, and report how many bytes were written back through the
-        // out-parameter.
-        SerializeWrappedDek(kek.provider_type, kek.key_id, ephemeral_pub, nonce, ciphertext, tag, out);
-        *out_len = static_cast<int32_t>(kTotalLen);
-        return HKDFGUARD_OK;
+        return WrapDekCore(service, dek, dek_len, out, out_len);
     } catch (const HkdfGuardError& e) {
         // The expected/"normal" failure path: one of our own helpers threw
         // a specific, meaningful status code - just hand it straight back
@@ -180,6 +203,37 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
         // makes the ABI's "no exception ever crosses this boundary"
         // guarantee unconditionally true, not just true for the specific
         // exception type this project happens to throw itself.
+        return HKDFGUARD_ERR_INTERNAL;
+    }
+}
+
+extern "C" HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
+    const char* service,
+    uint8_t* out, int32_t* out_len) {
+    try {
+        // `dek` is a SecureBuffer, not a plain stack array: it's zeroed by
+        // its own destructor the instant this function returns (any exit
+        // path, including an exception unwinding through WrapDekCore),
+        // exactly like `wrapping_key` inside WrapDekCore itself. This is
+        // the one and only place the freshly generated plaintext DEK
+        // exists at all - it's never returned to the caller (see
+        // hkdfguard.h's comment on this function) and never staged
+        // anywhere else.
+        SecureBuffer<HKDFGUARD_DEK_LEN> dek;
+
+        // BCRYPT_USE_SYSTEM_PREFERRED_RNG: the OS's CSPRNG, the same
+        // source AesGcmEncrypt uses for nonces (see aes_gcm.cpp) - not a
+        // plain PRNG.
+        NTSTATUS status = BCryptGenRandom(
+            nullptr, dek.data(), static_cast<ULONG>(HKDFGUARD_DEK_LEN), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (!BCRYPT_SUCCESS(status)) {
+            return HKDFGUARD_ERR_CRYPTO;
+        }
+
+        return WrapDekCore(service, dek.data(), HKDFGUARD_DEK_LEN, out, out_len);
+    } catch (const HkdfGuardError& e) {
+        return e.code();
+    } catch (...) {
         return HKDFGUARD_ERR_INTERNAL;
     }
 }
@@ -248,15 +302,19 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
             // unused, until the function returns.
             SecureBuffer<32> wrapping_key;
             // ECDH against the KEK's private key (may execute inside a
-            // TPM/vTPM) + HKDF-SHA256 -> the same 32-byte wrapping key
+            // TPM/vTPM) + HKDF-SHA512 -> the same 32-byte wrapping key
             // derived at wrap time.
             DeriveWrappingKeyForUnwrap(kek.provider.get(), kek.key.get(), parsed.ephemeral_pub, wrapping_key);
 
             // Decrypt directly into the caller's buffer - no intermediate
-            // plaintext staging buffer.
+            // plaintext staging buffer. AAD must match what AesGcmEncrypt
+            // used at wrap time: the same `service` string passed into
+            // this call.
             AesGcmDecrypt(
                 wrapping_key.data(), parsed.nonce, parsed.ciphertext,
-                static_cast<unsigned long>(kCiphertextLen), parsed.tag, out);
+                static_cast<unsigned long>(kCiphertextLen),
+                reinterpret_cast<const uint8_t*>(service), static_cast<unsigned long>(strlen(service)),
+                parsed.tag, out);
         } // <- wrapping_key's destructor (zeroing it) runs here, right now.
 
         // Success: `out` now holds the recovered plaintext DEK (its one
