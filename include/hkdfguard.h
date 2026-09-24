@@ -90,6 +90,8 @@ extern "C" {
 #define HKDFGUARD_ERR_AUTH_FAILED      (-5) /* AES-GCM authentication tag verification failed */
 #define HKDFGUARD_ERR_MALFORMED        (-6) /* wrapped payload is not a valid WrappedDekV1 */
 #define HKDFGUARD_ERR_INTERNAL         (-7) /* unexpected internal failure */
+#define HKDFGUARD_ERR_SERVICE_NAME_INVALID (-8) /* Service Name is malformed or invalid */
+#define HKDFGUARD_ERR_INVALID_POLICY   (-9) /* Invalid Key Storage Policy Flag */
 
 /*
  * Wraps a 32-byte DEK into a self-contained, versioned payload.
