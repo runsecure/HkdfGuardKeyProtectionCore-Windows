@@ -5,9 +5,6 @@
 
 namespace hkdfguard {
     namespace {
-        //KEK Storage Location policy
-        static constexpr KeyStoragePolicy kDefaultPolicy = KeyStoragePolicy::PreferTpm;
-
         // Builds the actual name a KEK is persisted under in Windows' key storage:
         // e.g. service "myapp" and key_id 1 becomes L"HkdfGuardWin_myapp_v1". The
         // `L"..."` prefix on each string literal marks it as a *wide* string literal
@@ -29,8 +26,200 @@ namespace hkdfguard {
         // LPCWSTR ("long pointer to constant wide string" - Windows' own typedef
         // for `const wchar_t*`) is the type both of those provider-name constants
         // have.
-        LPCWSTR ProviderName(uint8_t provider_type) {
-            return (provider_type == kProviderTypeTpm) ? MS_PLATFORM_CRYPTO_PROVIDER : MS_KEY_STORAGE_PROVIDER;
+        LPCWSTR ProviderName(
+            uint8_t provider_type)
+        {
+            switch (provider_type)
+            {
+                case kProviderTypeTpm:
+                    return MS_PLATFORM_CRYPTO_PROVIDER;
+
+                case kProviderTypeSoftware:
+                    return MS_KEY_STORAGE_PROVIDER;
+
+                default:
+                    throw HkdfGuardError(
+                        HKDFGUARD_ERR_PROVIDER,
+                        "invalid provider type");
+            }
+        }
+
+        // Verifies the Algorithm is P256
+        void VerifyAlgorithm(
+            NCRYPT_KEY_HANDLE key)
+        {
+            wchar_t algorithm[64] = {};
+
+            DWORD cbResult = 0;
+
+            SECURITY_STATUS status =
+                NCryptGetProperty(
+                    key,
+                    NCRYPT_ALGORITHM_PROPERTY,
+                    reinterpret_cast<PBYTE>(algorithm),
+                    sizeof(algorithm),
+                    &cbResult,
+                    0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "cannot query key algorithm");
+            }
+
+            if (wcscmp(
+                    algorithm,
+                    NCRYPT_ECDH_P256_ALGORITHM) != 0)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "unexpected key algorithm");
+            }
+        }
+
+        // Additional verification that key length is 256
+        void VerifyKeyLength(
+            NCRYPT_KEY_HANDLE key)
+        {
+            DWORD length = 0;
+            DWORD cbResult = 0;
+
+            SECURITY_STATUS status =
+                NCryptGetProperty(
+                    key,
+                    NCRYPT_LENGTH_PROPERTY,
+                    reinterpret_cast<PBYTE>(&length),
+                    sizeof(length),
+                    &cbResult,
+                    0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "cannot query key length");
+            }
+
+            if (length != 256)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "unexpected key length");
+            }
+        }
+
+        // Verifies the Usage is allow key agreement
+        void VerifyUsage(
+            NCRYPT_KEY_HANDLE key)
+        {
+            DWORD usage = 0;
+            DWORD cbResult = 0;
+
+            SECURITY_STATUS status =
+                NCryptGetProperty(
+                    key,
+                    NCRYPT_KEY_USAGE_PROPERTY,
+                    reinterpret_cast<PBYTE>(&usage),
+                    sizeof(usage),
+                    &cbResult,
+                    0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "cannot query key usage");
+            }
+
+            if ((usage &
+                 NCRYPT_ALLOW_KEY_AGREEMENT_FLAG) == 0)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "key agreement usage missing");
+            }
+        }
+
+        // Verifies there is no export agreement
+        void VerifyExportPolicy(
+            NCRYPT_KEY_HANDLE key)
+        {
+            DWORD policy = 0;
+            DWORD cbResult = 0;
+
+            SECURITY_STATUS status =
+                NCryptGetProperty(
+                    key,
+                    NCRYPT_EXPORT_POLICY_PROPERTY,
+                    reinterpret_cast<PBYTE>(&policy),
+                    sizeof(policy),
+                    &cbResult,
+                    0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "cannot query export policy");
+            }
+
+            if (policy &
+                (NCRYPT_ALLOW_EXPORT_FLAG |
+                 NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG))
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "key unexpectedly exportable");
+            }
+        }
+
+        // Verify the key is hardware backed when we set the TpmRequired policy
+        void VerifyHardwareBacked(
+            NCRYPT_KEY_HANDLE key)
+        {
+            DWORD implType = 0;
+            DWORD cbResult = 0;
+
+            SECURITY_STATUS status =
+                NCryptGetProperty(
+                    key,
+                    NCRYPT_IMPL_TYPE_PROPERTY,
+                    reinterpret_cast<PBYTE>(&implType),
+                    sizeof(implType),
+                    &cbResult,
+                    0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "cannot query implementation type");
+            }
+
+            if ((implType & NCRYPT_IMPL_HARDWARE_FLAG) == 0)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "key is not hardware backed");
+            }
+        }
+
+        void VerifyKeyProperties(
+            NCRYPT_KEY_HANDLE key,
+            KeyStoragePolicy policy,
+            uint8_t provider_type)
+        {
+            VerifyAlgorithm(key);
+            VerifyKeyLength(key);
+            VerifyUsage(key);
+            VerifyExportPolicy(key);
+
+            if (policy == KeyStoragePolicy::RequireTpm ||
+                provider_type == kProviderTypeTpm)
+            {
+                VerifyHardwareBacked(key);
+            }
         }
 
         // Opens the existing persisted KEK by name on the given provider, or creates
@@ -38,7 +227,7 @@ namespace hkdfguard {
         // not yet exist. Throws HkdfGuardError(HKDFGUARD_ERR_PROVIDER) on any
         // failure, including the provider itself being unavailable.
         ResolvedKek ResolveOrCreateOnProvider(
-            const std::wstring &service, LPCWSTR provider_name, uint8_t provider_type, uint32_t key_id) {
+            const std::wstring &service, LPCWSTR provider_name, uint8_t provider_type, uint32_t key_id, KeyStoragePolicy policy) {
             // `ResolvedKek result;` default-constructs the struct - its two Scoped*
             // members start out owning nothing, and its two plain fields are filled
             // in immediately below (they don't have default values of their own).
@@ -74,10 +263,11 @@ namespace hkdfguard {
             // not a fallback chain).
             status = NCryptOpenKey(result.provider.get(), result.key.put(), name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG);
             if (status == ERROR_SUCCESS) {
-                // The key already existed from a previous call - nothing left to
-                // do, hand back what we've got. Returning `result` here moves it
-                // out (see handle_traits.h's note on ScopedHandle's move
-                // constructor); nothing is copied.
+                // The key already existed from a previous call - now verify the key properties
+                VerifyKeyProperties(
+                    result.key.get(),
+                    policy,
+                    provider_type);
                 return result;
             }
             // NTE_BAD_KEYSET is NCrypt's specific "no key with that name exists in
@@ -102,34 +292,50 @@ namespace hkdfguard {
                 throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptCreatePersistedKey failed");
             }
 
-            // Before finalizing the new key, explicitly lock down what it's allowed
-            // to be used for. These two NCryptSetProperty calls' return values are
-            // deliberately not checked: they're best-effort hardening on top of
-            // what's already the provider's own default policy (a freshly created
-            // key isn't exportable and isn't usable for anything unless explicitly
-            // enabled), not something this function's correctness depends on.
             DWORD export_policy = 0; // no NCRYPT_ALLOW_EXPORT_FLAG => non-exportable private key
-            NCryptSetProperty(
-                result.key.get(), NCRYPT_EXPORT_POLICY_PROPERTY,
-                // NCryptSetProperty's data parameter is a generic `PBYTE` (pointer
-                // to bytes); `reinterpret_cast<PBYTE>(&export_policy)` reinterprets
-                // the address of our local DWORD as a byte pointer so its 4 bytes
-                // can be handed over that way - the standard pattern for passing a
-                // "plain old data" value through this kind of untyped API.
-                reinterpret_cast<PBYTE>(&export_policy), sizeof(export_policy), 0);
+            status = NCryptSetProperty(
+                result.key.get(),
+                NCRYPT_EXPORT_POLICY_PROPERTY,
+                reinterpret_cast<PBYTE>(&export_policy),
+                sizeof(export_policy),
+                0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                HKDFGUARD_ERR_PROVIDER,
+                "setting export policy failed");
+            }
 
             DWORD key_usage = NCRYPT_ALLOW_KEY_AGREEMENT_FLAG; // only ECDH key-agreement, nothing else
-            NCryptSetProperty(
-                result.key.get(), NCRYPT_KEY_USAGE_PROPERTY,
-                reinterpret_cast<PBYTE>(&key_usage), sizeof(key_usage), 0);
+            status = NCryptSetProperty(
+                result.key.get(),
+                NCRYPT_KEY_USAGE_PROPERTY,
+                reinterpret_cast<PBYTE>(&key_usage),
+                sizeof(key_usage),
+                0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                HKDFGUARD_ERR_PROVIDER,
+                "setting key usage failed");
+            }
 
             // NCryptFinalizeKey commits the key: after this call it's actually
             // usable and persisted to storage, and most of its properties
             // (including the two just set above) can no longer be changed.
             status = NCryptFinalizeKey(result.key.get(), 0);
+
             if (status != ERROR_SUCCESS) {
-                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptFinalizeKey failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER,
+                    "NCryptFinalizeKey failed");
             }
+
+            VerifyKeyProperties(
+                result.key.get(),
+                policy,
+                provider_type);
 
             return result;
         }
@@ -138,21 +344,25 @@ namespace hkdfguard {
     ResolvedKek ResolveOrCreateKekForWrap(
     const std::wstring& service)
     {
-        switch (LoadEffectivePolicy()) {
+        KeyStoragePolicy policy = LoadEffectivePolicy();
+
+        switch (policy) {
 
             case KeyStoragePolicy::RequireTpm:
                 return ResolveOrCreateOnProvider(
                     service,
                     MS_PLATFORM_CRYPTO_PROVIDER,
                     kProviderTypeTpm,
-                    kCurrentKeyId);
+                    kCurrentKeyId,
+                    policy);
 
             case KeyStoragePolicy::SoftwareOnly:
                 return ResolveOrCreateOnProvider(
                     service,
                     MS_KEY_STORAGE_PROVIDER,
                     kProviderTypeSoftware,
-                    kCurrentKeyId);
+                    kCurrentKeyId,
+                    policy);
 
             case KeyStoragePolicy::PreferTpm:
                 try {
@@ -160,14 +370,16 @@ namespace hkdfguard {
                         service,
                         MS_PLATFORM_CRYPTO_PROVIDER,
                         kProviderTypeTpm,
-                        kCurrentKeyId);
+                        kCurrentKeyId,
+                        policy);
                 }
                 catch (const HkdfGuardError&) {
                     return ResolveOrCreateOnProvider(
                         service,
                         MS_KEY_STORAGE_PROVIDER,
                         kProviderTypeSoftware,
-                        kCurrentKeyId);
+                        kCurrentKeyId,
+                        policy);
                 }
         }
 
@@ -202,6 +414,13 @@ namespace hkdfguard {
         if (status != ERROR_SUCCESS) {
             throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenKey failed");
         }
+
+        KeyStoragePolicy policy = LoadEffectivePolicy();
+
+        VerifyKeyProperties(
+            result.key.get(),
+            policy,
+            result.provider_type);
 
         return result;
     }

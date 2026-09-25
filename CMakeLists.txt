@@ -50,8 +50,7 @@ add_library(hkdfguard SHARED
     src/kek_store.cpp
     src/ecdh_hkdf.cpp
     src/aes_gcm.cpp
-        src/Policy.h
-        src/policy.cpp
+    src/policy.cpp
 )
 
 # Names the actual output files (the .dll and its companion .lib import

@@ -6,6 +6,10 @@
 #include <cstring> // memcpy
 #include <vector>
 
+#ifndef BCRYPT_KDF_RAW_SECRET
+#define BCRYPT_KDF_RAW_SECRET L"TRUNCATE"
+#endif
+
 // Design note: wrap-side (BCryptSecretAgreement, software ephemeral key) and
 // unwrap-side (NCryptSecretAgreement, possibly TPM-backed KEK) derivation
 // MUST produce bit-identical wrapping keys from identical inputs, or every

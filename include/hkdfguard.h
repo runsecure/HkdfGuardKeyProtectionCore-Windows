@@ -112,17 +112,8 @@ extern "C" {
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
  * On failure, no partial output is left in the caller's buffer.
- */
-// Reading the declaration itself: HKDFGUARD_API expands to dllexport/
-// dllimport as explained above. int32_t is the return type. `const uint8_t*
-// dek` is a pointer to bytes the function will only ever read (const), never
-// write, through that pointer - a documentation-and-compiler-enforced
-// promise to the caller. `int32_t* out_len` is a pointer to a single
-// int32_t that acts as *both* an input (the caller writes the buffer's
-// capacity into it before calling) and an output (the function overwrites
-// it with the actual result length on success) - this "in/out parameter"
-// pattern is how C APIs return more than one value without needing a struct
-// or multiple return values.
+*/
+
 HKDFGUARD_API int32_t hkdfguard_wrap_dek(
     const char* service,
     const uint8_t* dek, int32_t dek_len,
@@ -149,26 +140,6 @@ HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
     const uint8_t* wrapped, int32_t wrapped_len,
     uint8_t* out, int32_t* out_len);
 
-/*
- * Generates a fresh, cryptographically random 32-byte DEK and immediately
- * wraps it under the persistent KEK identified by `service`, in one call -
- * for callers that want a brand new Ephemeral Data Protection Key without
- * having to source their own randomness.
- *
- * The newly generated plaintext DEK never crosses this ABI boundary: it is
- * zeroed internally the instant it has been wrapped, before this function
- * returns. To recover it later, unwrap the resulting payload via
- * hkdfguard_unwrap_dek, passing the same `service`.
- *
- * service   - see hkdfguard_wrap_dek.
- * out       - caller-owned output buffer.
- * out_len   - in: capacity of out, in bytes.
- *             out: on success, the number of bytes written (always
- *             HKDFGUARD_WRAPPED_LEN).
- *
- * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
- * On failure, no partial output is left in the caller's buffer.
- */
 HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
     const char* service,
     uint8_t* out, int32_t* out_len);
