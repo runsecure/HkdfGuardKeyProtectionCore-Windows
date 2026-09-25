@@ -38,13 +38,12 @@ namespace {
     constexpr size_t kMaxServiceLen = 128; // bytes, excluding the null terminator
 
     // Validates that the incoming servicename is alphanumeric or period(dot)
-    bool IsValidServiceChar(char c) noexcept
-    {
+    bool IsValidServiceChar(char c) noexcept {
         return
-        (c >= 'A' && c <= 'Z') ||
-        (c >= 'a' && c <= 'z') ||
-        (c >= '0' && c <= '9') ||
-        c == '.';
+                (c >= 'A' && c <= 'Z') ||
+                (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') ||
+                c == '.';
     }
 
     // Validates and converts the caller's UTF-8 service name into the wide
@@ -73,13 +72,13 @@ namespace {
         for (size_t i = 0; i < len; ++i) {
             if (!IsValidServiceChar(service[i])) {
                 throw HkdfGuardError(
-                HKDFGUARD_ERR_SERVICE_NAME_INVALID,
-                "service contains invalid characters");
+                    HKDFGUARD_ERR_SERVICE_NAME_INVALID,
+                    "service contains invalid characters");
             }
         }
 
         // Converting UTF-8 (`service`, as documented in hkdfguard.h) to UTF-16
-        // (the std::wstring every NCrypt key-name parameter ultimately needs)
+        // (the std::string every NCrypt key-name parameter ultimately needs)
         // is, like several other Windows APIs already seen in this project, a
         // two-call "ask for the size, then convert for real" operation.
         // MB_ERR_INVALID_CHARS makes the call fail outright (returning 0)
@@ -89,7 +88,7 @@ namespace {
         if (wide_len <= 0) {
             throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "service is not valid UTF-8");
         }
-        // `std::wstring wide(static_cast<size_t>(wide_len), L'\0')` constructs a
+        // `std::string wide(static_cast<size_t>(wide_len), L'\0')` constructs a
         // wide string of exactly `wide_len` characters, every one initially
         // L'\0' - i.e. pre-allocates the right amount of storage for
         // MultiByteToWideChar's second call to write its real output into via
@@ -130,7 +129,7 @@ namespace {
         // Creating it for the first time requires this process to be elevated
         // (see kek_store.h/.cpp) - by design, for a deployment-time wrap step
         // ahead of a separate account unwrapping later.
-        ResolvedKek kek = ResolveOrCreateKekForWrap(service_name);
+        ResolvedKek kek = OpenKekForWrap(service_name);
 
         // Ephemeral ECDH + HKDF-SHA512 -> 32-byte AES wrapping key. Only the
         // KEK's public key is needed here, so this never touches the TPM.
@@ -179,6 +178,67 @@ namespace {
         *out_len = static_cast<int32_t>(kTotalLen);
         return HKDFGUARD_OK;
     }
+
+    std::vector<std::wstring> ParseAndConvertGroups(
+        const char *groups_csv) {
+        std::vector<std::wstring> result;
+
+        if (groups_csv == nullptr || *groups_csv == '\0') {
+            return result;
+        }
+
+        std::string csv(groups_csv);
+
+        size_t start = 0;
+
+        while (start < csv.size()) {
+            size_t comma = csv.find(',', start);
+
+            std::string token =
+                    (comma == std::string::npos)
+                        ? csv.substr(start)
+                        : csv.substr(start, comma - start);
+
+            if (!token.empty()) {
+                int wide_len =
+                        MultiByteToWideChar(
+                            CP_UTF8,
+                            MB_ERR_INVALID_CHARS,
+                            token.c_str(),
+                            static_cast<int>(token.size()),
+                            nullptr,
+                            0);
+
+                if (wide_len <= 0) {
+                    throw HkdfGuardError(
+                        HKDFGUARD_ERR_INVALID_ARG,
+                        "group name is not valid UTF-8");
+                }
+
+                std::wstring wide(
+                    static_cast<size_t>(wide_len),
+                    L'\0');
+
+                MultiByteToWideChar(
+                    CP_UTF8,
+                    MB_ERR_INVALID_CHARS,
+                    token.c_str(),
+                    static_cast<int>(token.size()),
+                    wide.data(),
+                    wide_len);
+
+                result.push_back(std::move(wide));
+            }
+
+            if (comma == std::string::npos) {
+                break;
+            }
+
+            start = comma + 1;
+        }
+
+        return result;
+    }
 } // namespace
 
 // `extern "C"` here (repeated at each function, rather than wrapping both
@@ -219,6 +279,28 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
         // makes the ABI's "no exception ever crosses this boundary"
         // guarantee unconditionally true, not just true for the specific
         // exception type this project happens to throw itself.
+        return HKDFGUARD_ERR_INTERNAL;
+    }
+}
+
+extern "C" HKDFGUARD_API int32_t hkdfguard_ensure_kek(
+    const char *service,
+    const char *groups_csv) {
+    try {
+        std::wstring service_name =
+                ValidateAndConvertService(service);
+
+        std::vector<std::wstring> groups =
+                ParseAndConvertGroups(groups_csv);
+
+        EnsureKek(
+            service_name,
+            groups);
+
+        return HKDFGUARD_OK;
+    } catch (const HkdfGuardError &e) {
+        return e.code();
+    } catch (...) {
         return HKDFGUARD_ERR_INTERNAL;
     }
 }

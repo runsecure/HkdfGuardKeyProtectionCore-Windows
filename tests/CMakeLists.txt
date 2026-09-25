@@ -13,6 +13,7 @@ add_executable(test_roundtrip
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_store.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
 )
 # Links against hkdfguard (the DLL's import library, for the public ABI
 # calls) plus the two raw Windows crypto libraries directly (needed because

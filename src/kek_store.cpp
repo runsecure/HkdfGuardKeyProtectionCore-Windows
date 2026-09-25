@@ -2,6 +2,7 @@
 #include "errors.h"
 #include <string>
 #include "policy.h"
+#include "key_acl.h"
 
 namespace hkdfguard {
     namespace {
@@ -222,114 +223,47 @@ namespace hkdfguard {
             }
         }
 
-        // Opens the existing persisted KEK by name on the given provider, or creates
-        // it (non-exportable, key-agreement-only, machine-wide scoped) if it does
-        // not yet exist. Throws HkdfGuardError(HKDFGUARD_ERR_PROVIDER) on any
-        // failure, including the provider itself being unavailable.
-        ResolvedKek ResolveOrCreateOnProvider(
-            const std::wstring &service, LPCWSTR provider_name, uint8_t provider_type, uint32_t key_id, KeyStoragePolicy policy) {
-            // `ResolvedKek result;` default-constructs the struct - its two Scoped*
-            // members start out owning nothing, and its two plain fields are filled
-            // in immediately below (they don't have default values of their own).
+        ResolvedKek OpenKekOnProvider(
+            const std::wstring& service,
+            LPCWSTR provider_name,
+            uint8_t provider_type,
+            uint32_t key_id,
+            KeyStoragePolicy policy)
+        {
             ResolvedKek result;
+
             result.provider_type = provider_type;
             result.key_id = key_id;
 
-            // NCryptOpenStorageProvider is how you get a handle to one of Windows'
-            // key-storage backends at all - e.g. "the TPM-backed one" or "the pure
-            // software one" - before you can open or create any key within it.
-            // `result.provider.put()` (see handle_traits.h) hands the API the
-            // address to write the new handle into.
-            SECURITY_STATUS status = NCryptOpenStorageProvider(result.provider.put(), provider_name, 0);
-            if (status != ERROR_SUCCESS) {
-                // This is exactly the failure path that lets
-                // ResolveOrCreateKekForWrap (below) detect "no TPM here" and fall
-                // back to the software provider - see its own comment for how.
-                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenStorageProvider failed");
-            }
-
-            std::wstring name = KeyName(service, key_id);
-
-            // NCRYPT_MACHINE_KEY_FLAG => this key lives in the machine-wide key
-            // store, not the calling account's own profile: any local account can
-            // open/use it (subject to the key's ACL, left at NCrypt's default for
-            // a machine key), not only the one that created it. This is
-            // deliberate - the deployment model this project targets is "a
-            // deployment-time process, typically elevated, wraps a DEK once; a
-            // different, lower-privileged service account unwraps it later" - see
-            // OpenKekForUnwrap below, which must request the same flag for that
-            // second account's NCryptOpenKey to find this key at all (per-user and
-            // machine-wide are two disjoint key stores from NCrypt's perspective,
-            // not a fallback chain).
-            status = NCryptOpenKey(result.provider.get(), result.key.put(), name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG);
-            if (status == ERROR_SUCCESS) {
-                // The key already existed from a previous call - now verify the key properties
-                VerifyKeyProperties(
-                    result.key.get(),
-                    policy,
-                    provider_type);
-                return result;
-            }
-            // NTE_BAD_KEYSET is NCrypt's specific "no key with that name exists in
-            // this provider yet" error - the one and only failure we're prepared to
-            // recover from by creating a new key. Anything else (e.g. access
-            // denied) is treated as a hard failure instead.
-            if (status != NTE_BAD_KEYSET) {
-                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenKey failed");
-            }
-
-            // Key does not exist yet on this provider: create it, machine-wide
-            // (see the NCryptOpenKey call above for why). Creating a machine key
-            // requires the calling process to be running elevated - by design, per
-            // the deployment model this targets: an elevated deployment-time
-            // utility calls hkdfguard_wrap_dek once (which creates the KEK on
-            // first use), and the lower-privileged account that unwraps it later
-            // never needs to create anything.
-            status = NCryptCreatePersistedKey(
-                result.provider.get(), result.key.put(),
-                NCRYPT_ECDH_P256_ALGORITHM, name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG);
-            if (status != ERROR_SUCCESS) {
-                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptCreatePersistedKey failed");
-            }
-
-            DWORD export_policy = 0; // no NCRYPT_ALLOW_EXPORT_FLAG => non-exportable private key
-            status = NCryptSetProperty(
-                result.key.get(),
-                NCRYPT_EXPORT_POLICY_PROPERTY,
-                reinterpret_cast<PBYTE>(&export_policy),
-                sizeof(export_policy),
-                0);
+            SECURITY_STATUS status =
+                NCryptOpenStorageProvider(
+                    result.provider.put(),
+                    provider_name,
+                    0);
 
             if (status != ERROR_SUCCESS)
             {
                 throw HkdfGuardError(
-                HKDFGUARD_ERR_PROVIDER,
-                "setting export policy failed");
+                    HKDFGUARD_ERR_PROVIDER,
+                    "NCryptOpenStorageProvider failed");
             }
 
-            DWORD key_usage = NCRYPT_ALLOW_KEY_AGREEMENT_FLAG; // only ECDH key-agreement, nothing else
-            status = NCryptSetProperty(
-                result.key.get(),
-                NCRYPT_KEY_USAGE_PROPERTY,
-                reinterpret_cast<PBYTE>(&key_usage),
-                sizeof(key_usage),
-                0);
+            std::wstring name =
+                KeyName(service, key_id);
+
+            status =
+                NCryptOpenKey(
+                    result.provider.get(),
+                    result.key.put(),
+                    name.c_str(),
+                    0,
+                    NCRYPT_MACHINE_KEY_FLAG);
 
             if (status != ERROR_SUCCESS)
             {
                 throw HkdfGuardError(
-                HKDFGUARD_ERR_PROVIDER,
-                "setting key usage failed");
-            }
-
-            // NCryptFinalizeKey commits the key: after this call it's actually
-            // usable and persisted to storage, and most of its properties
-            // (including the two just set above) can no longer be changed.
-            status = NCryptFinalizeKey(result.key.get(), 0);
-
-            if (status != ERROR_SUCCESS) {
-                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER,
-                    "NCryptFinalizeKey failed");
+                    HKDFGUARD_ERR_PROVIDER,
+                    "NCryptOpenKey failed");
             }
 
             VerifyKeyProperties(
@@ -339,17 +273,227 @@ namespace hkdfguard {
 
             return result;
         }
+
+        void EnsureKekOnProvider(
+            const std::wstring& service,
+            LPCWSTR providerName,
+            uint8_t providerType,
+            const std::vector<std::wstring>& aclGroups,
+            KeyStoragePolicy policy)
+        {
+            //
+            // Open provider.
+            //
+
+            ScopedNCryptProv provider;
+
+            SECURITY_STATUS status =
+                NCryptOpenStorageProvider(
+                    provider.put(),
+                    providerName,
+                    0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "NCryptOpenStorageProvider failed");
+            }
+
+            //
+            // Open existing key.
+            //
+
+            std::wstring name =
+                KeyName(
+                    service,
+                    kCurrentKeyId);
+
+            ScopedNCryptKey key;
+
+            status =
+                NCryptOpenKey(
+                    provider.get(),
+                    key.put(),
+                    name.c_str(),
+                    0,
+                    NCRYPT_MACHINE_KEY_FLAG);
+
+            if (status == ERROR_SUCCESS)
+            {
+                VerifyKeyProperties(
+                    key.get(),
+                    policy,
+                    providerType);
+
+                return;
+            }
+
+            if (status != NTE_BAD_KEYSET)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "NCryptOpenKey failed");
+            }
+
+            //
+            // Create missing key.
+            //
+
+            status =
+                NCryptCreatePersistedKey(
+                    provider.get(),
+                    key.put(),
+                    NCRYPT_ECDH_P256_ALGORITHM,
+                    name.c_str(),
+                    0,
+                    NCRYPT_MACHINE_KEY_FLAG);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "NCryptCreatePersistedKey failed");
+            }
+
+            DWORD exportPolicy = 0;
+
+            status =
+                NCryptSetProperty(
+                    key.get(),
+                    NCRYPT_EXPORT_POLICY_PROPERTY,
+                    reinterpret_cast<PBYTE>(&exportPolicy),
+                    sizeof(exportPolicy),
+                    0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "setting export policy failed");
+            }
+
+            DWORD keyUsage =
+                NCRYPT_ALLOW_KEY_AGREEMENT_FLAG;
+
+            status =
+                NCryptSetProperty(
+                    key.get(),
+                    NCRYPT_KEY_USAGE_PROPERTY,
+                    reinterpret_cast<PBYTE>(&keyUsage),
+                    sizeof(keyUsage),
+                    0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "setting key usage failed");
+            }
+
+            //
+            // NEW:
+            //
+
+            ApplyKeyAcl(
+                key.get(),
+                aclGroups);
+
+            status =
+                NCryptFinalizeKey(
+                    key.get(),
+                    0);
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "NCryptFinalizeKey failed");
+            }
+
+            VerifyKeyProperties(
+                key.get(),
+                policy,
+                providerType);
+
+            VerifyKeyAcl(
+                key.get(),
+                aclGroups);
+        }
     } // namespace
 
-    ResolvedKek ResolveOrCreateKekForWrap(
-    const std::wstring& service)
+    void EnsureKek(
+        const std::wstring& service,
+        const std::vector<std::wstring>& aclGroups)
+    {
+        KeyStoragePolicy policy =
+            LoadEffectivePolicy();
+
+        switch (policy)
+        {
+            case KeyStoragePolicy::RequireTpm:
+            {
+                EnsureKekOnProvider(
+                    service,
+                    MS_PLATFORM_CRYPTO_PROVIDER,
+                    kProviderTypeTpm,
+                    aclGroups,
+                    policy);
+
+                return;
+            }
+
+            case KeyStoragePolicy::SoftwareOnly:
+            {
+                EnsureKekOnProvider(
+                    service,
+                    MS_KEY_STORAGE_PROVIDER,
+                    kProviderTypeSoftware,
+                    aclGroups,
+                    policy);
+
+                return;
+            }
+
+            case KeyStoragePolicy::PreferTpm:
+            {
+                try
+                {
+                    EnsureKekOnProvider(
+                        service,
+                        MS_PLATFORM_CRYPTO_PROVIDER,
+                        kProviderTypeTpm,
+                        aclGroups,
+                        policy);
+                }
+                catch (const HkdfGuardError&)
+                {
+                    EnsureKekOnProvider(
+                        service,
+                        MS_KEY_STORAGE_PROVIDER,
+                        kProviderTypeSoftware,
+                        aclGroups,
+                        policy);
+                }
+
+                return;
+            }
+        }
+
+        throw HkdfGuardError(
+            HKDFGUARD_ERR_INVALID_POLICY,
+            "invalid key storage policy");
+    }
+
+    ResolvedKek OpenKekForWrap(
+        const std::wstring& service)
     {
         KeyStoragePolicy policy = LoadEffectivePolicy();
 
         switch (policy) {
 
             case KeyStoragePolicy::RequireTpm:
-                return ResolveOrCreateOnProvider(
+                return OpenKekOnProvider(
                     service,
                     MS_PLATFORM_CRYPTO_PROVIDER,
                     kProviderTypeTpm,
@@ -357,7 +501,7 @@ namespace hkdfguard {
                     policy);
 
             case KeyStoragePolicy::SoftwareOnly:
-                return ResolveOrCreateOnProvider(
+                return OpenKekOnProvider(
                     service,
                     MS_KEY_STORAGE_PROVIDER,
                     kProviderTypeSoftware,
@@ -366,7 +510,7 @@ namespace hkdfguard {
 
             case KeyStoragePolicy::PreferTpm:
                 try {
-                    return ResolveOrCreateOnProvider(
+                    return OpenKekOnProvider(
                         service,
                         MS_PLATFORM_CRYPTO_PROVIDER,
                         kProviderTypeTpm,
@@ -374,7 +518,7 @@ namespace hkdfguard {
                         policy);
                 }
                 catch (const HkdfGuardError&) {
-                    return ResolveOrCreateOnProvider(
+                    return OpenKekOnProvider(
                         service,
                         MS_KEY_STORAGE_PROVIDER,
                         kProviderTypeSoftware,

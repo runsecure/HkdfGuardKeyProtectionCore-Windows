@@ -51,6 +51,7 @@ add_library(hkdfguard SHARED
     src/ecdh_hkdf.cpp
     src/aes_gcm.cpp
     src/policy.cpp
+    src/key_acl.cpp
 )
 
 # Names the actual output files (the .dll and its companion .lib import

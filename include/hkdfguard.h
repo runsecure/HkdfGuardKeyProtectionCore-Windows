@@ -93,6 +93,10 @@ extern "C" {
 #define HKDFGUARD_ERR_SERVICE_NAME_INVALID (-8) /* Service Name is malformed or invalid */
 #define HKDFGUARD_ERR_INVALID_POLICY   (-9) /* Invalid Key Storage Policy Flag */
 
+HKDFGUARD_API int32_t hkdfguard_ensure_kek(
+    const char* service,
+    const char* groups_csv);
+
 /*
  * Wraps a 32-byte DEK into a self-contained, versioned payload.
  *
