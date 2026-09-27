@@ -134,7 +134,12 @@ HKDFGUARD_API int32_t hkdfguard_create_kek(
  *             service name must be passed to hkdfguard_unwrap_dek to unwrap
  *             a payload produced with it; the service name itself is not
  *             recorded in the wrapped payload. Must be non-null, non-empty,
- *             and at most 128 bytes (excluding the null terminator).
+ *             and at most 128 bytes (excluding the null terminator), and may
+ *             only contain ASCII letters, digits, and '.'. Case-insensitive:
+ *             normalized to lowercase internally, so "MyApp" and "myapp"
+ *             identify the same KEK and may be used interchangeably across
+ *             hkdfguard_create_kek/hkdfguard_kek_exists/hkdfguard_wrap_dek/
+ *             hkdfguard_unwrap_dek calls for the same logical service.
  *             hkdfguard_create_kek must have already provisioned this
  *             service's KEK; this function never creates one.
  * dek       - pointer to exactly HKDFGUARD_DEK_LEN bytes of plaintext DEK.

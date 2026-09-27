@@ -303,6 +303,56 @@ int main() {
     // way it is for e.g. std::vector or std::string.
     Check(std::memcmp(dek.data(), unwrapped.data(), HKDFGUARD_DEK_LEN) == 0, "unwrapped DEK matches original");
 
+    // ---- 1b. Service names are case-insensitive: a service name that only ----
+    //          differs in case from kService resolves to the exact same KEK,
+    //          and wrap/unwrap can mix casing freely across calls - not just
+    //          "same KEK, but the AAD only matches if the casing happens to
+    //          be identical too" (see hkdfguard.cpp's NormalizeService,
+    //          which normalizes the AAD bytes as well as the KEK name).
+    constexpr char kServiceMixedCase[] = "HkdfGuardWin.Test.SERVICE";
+
+    int32_t mixed_case_exists = -1;
+    rc = hkdfguard_kek_exists(kServiceMixedCase, &mixed_case_exists);
+    Check(rc == HKDFGUARD_OK, "kek_exists succeeds for a differently-cased alias of an existing service");
+    Check(mixed_case_exists == 1, "kek_exists reports true for a differently-cased alias of an existing service");
+
+    rc = hkdfguard_create_kek(kServiceMixedCase, nullptr);
+    Check(rc == HKDFGUARD_OK, "create_kek is idempotent for a differently-cased alias of an existing service");
+
+    // Wrap using the mixed-case alias; it must reuse kService's existing KEK
+    // (same provider), not provision a second, independent one.
+    std::vector<uint8_t> wrapped_mixed_case(HKDFGUARD_WRAPPED_LEN);
+    int32_t wrapped_mixed_case_len = static_cast<int32_t>(wrapped_mixed_case.size());
+    rc = hkdfguard_wrap_dek(
+        kServiceMixedCase, dek.data(), static_cast<int32_t>(dek.size()), wrapped_mixed_case.data(),
+        &wrapped_mixed_case_len);
+    Check(rc == HKDFGUARD_OK, "wrap succeeds using a differently-cased alias of an existing service");
+    Check(wrapped_mixed_case[1] == provider_type, "wrap via a differently-cased alias reuses the same provider/KEK");
+
+    // Unwrap that payload using the original lowercase form.
+    std::vector<uint8_t> unwrapped_via_lowercase(HKDFGUARD_DEK_LEN);
+    int32_t unwrapped_via_lowercase_len = static_cast<int32_t>(unwrapped_via_lowercase.size());
+    rc = hkdfguard_unwrap_dek(
+        kService, wrapped_mixed_case.data(), wrapped_mixed_case_len, unwrapped_via_lowercase.data(),
+        &unwrapped_via_lowercase_len);
+    Check(rc == HKDFGUARD_OK, "unwrap succeeds using the lowercase form of a payload wrapped via a mixed-case alias");
+    Check(
+        std::memcmp(dek.data(), unwrapped_via_lowercase.data(), HKDFGUARD_DEK_LEN) == 0,
+        "unwrapped DEK matches original when wrap/unwrap use differently-cased service names");
+
+    // And the reverse direction: unwrap `wrapped` (from check 1 above,
+    // wrapped under the original lowercase kService) using the mixed-case
+    // alias instead.
+    std::vector<uint8_t> unwrapped_via_mixed_case(HKDFGUARD_DEK_LEN);
+    int32_t unwrapped_via_mixed_case_len = static_cast<int32_t>(unwrapped_via_mixed_case.size());
+    rc = hkdfguard_unwrap_dek(
+        kServiceMixedCase, wrapped.data(), wrapped_len, unwrapped_via_mixed_case.data(),
+        &unwrapped_via_mixed_case_len);
+    Check(rc == HKDFGUARD_OK, "unwrap succeeds using a mixed-case alias of the service a payload was wrapped under");
+    Check(
+        std::memcmp(dek.data(), unwrapped_via_mixed_case.data(), HKDFGUARD_DEK_LEN) == 0,
+        "unwrapped DEK matches original when unwrap uses a differently-cased alias of the wrapping service");
+
     // ---- 2. Unwrapping the same payload again is idempotent: the payload ----
     //         isn't mutated/consumed by a successful unwrap, so a second,
     //         independent unwrap of the exact same bytes must succeed again

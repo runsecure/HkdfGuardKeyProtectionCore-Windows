@@ -9,6 +9,16 @@
 
 namespace hkdfguard {
 
+    // Every `service` parameter below is used verbatim to build the
+    // persisted KEK's name (see kek_store.cpp's KeyName) - this layer does
+    // no normalization of its own. The public C ABI (hkdfguard.cpp)
+    // lowercases and validates `service` before calling any of these, so
+    // two callers whose service names differ only in case resolve to the
+    // same KEK; a caller that reaches this API directly (bypassing
+    // hkdfguard.cpp, as this project's own tests do to reach CreateKek/
+    // KekExists/DeleteKek for setup and cleanup) is responsible for
+    // supplying an already-normalized `service` itself if it wants that
+    // same behavior.
     constexpr uint32_t kCurrentKeyId = 1;
 
     struct ResolvedKek {

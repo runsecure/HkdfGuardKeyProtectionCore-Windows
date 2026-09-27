@@ -13,7 +13,7 @@
 #include "wire_format.h"
 
 // windows.h: MultiByteToWideChar, CP_UTF8, MB_ERR_INVALID_CHARS (used by
-// ValidateAndConvertService below). bcrypt.h: BCryptGenRandom (used by
+// ServiceToWide below). bcrypt.h: BCryptGenRandom (used by
 // hkdfguard_generate_and_wrap_dek below to source the new DEK's
 // randomness). cstring: strnlen, memcpy. string: std::wstring.
 #include <windows.h>
@@ -47,11 +47,31 @@ namespace {
                 c == '.';
     }
 
-    // Validates and converts the caller's UTF-8 service name into the wide
-    // string used as part of the persisted KEK's name. Throws
-    // HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG) if `service` is null, empty,
-    // too long, or not valid UTF-8.
-    std::wstring ValidateAndConvertService(const char *service) {
+    // Lowercases a single ASCII byte; anything else (digits, '.') is
+    // returned unchanged. Written by hand, rather than via <cctype>'s
+    // tolower, to avoid that function's locale-dependent behavior - this
+    // codebase's service-name charset is pure ASCII by construction (see
+    // IsValidServiceChar), so a fixed 'A'-'Z' range is all this ever needs
+    // to handle.
+    char ToLowerServiceChar(char c) noexcept {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    }
+
+    // Validates `service` (null/length/charset - see IsValidServiceChar) and
+    // returns a lowercase-normalized copy of it as a narrow ASCII string.
+    // Normalizing case here, at the one place every public entry point's
+    // `service` argument passes through, means two callers who differ only
+    // in case (e.g. "MyApp" and "myapp") are treated as the exact same
+    // service everywhere downstream: the same persisted KEK name (see
+    // ServiceToWide/kek_store.cpp's KeyName) and the same AES-GCM AAD bytes
+    // (see WrapDekCore/hkdfguard_unwrap_dek below) - not just a
+    // case-insensitive KEK lookup with case-sensitive AAD underneath it,
+    // which would make wrap/unwrap fail whenever the two calls' casing
+    // didn't match exactly.
+    //
+    // Throws HkdfGuardError if `service` is null, empty, too long, or
+    // contains a character outside the allowed charset.
+    std::string NormalizeService(const char *service) {
         if (service == nullptr) {
             throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "service is null");
         }
@@ -70,33 +90,52 @@ namespace {
             throw HkdfGuardError(HKDFGUARD_ERR_SERVICE_NAME_INVALID, "service is empty or too long");
         }
 
-        for (size_t i = 0; i < len; ++i) {
-            if (!IsValidServiceChar(service[i])) {
+        std::string normalized(service, len);
+        for (char &c : normalized) {
+            if (!IsValidServiceChar(c)) {
                 throw HkdfGuardError(
                     HKDFGUARD_ERR_SERVICE_NAME_INVALID,
                     "service contains invalid characters");
             }
+            c = ToLowerServiceChar(c);
         }
+        return normalized;
+    }
 
-        // Converting UTF-8 (`service`, as documented in hkdfguard.h) to UTF-16
-        // (the std::string every NCrypt key-name parameter ultimately needs)
-        // is, like several other Windows APIs already seen in this project, a
-        // two-call "ask for the size, then convert for real" operation.
-        // MB_ERR_INVALID_CHARS makes the call fail outright (returning 0)
-        // rather than silently substituting a placeholder character if
-        // `service` isn't actually valid UTF-8.
-        int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, service, static_cast<int>(len), nullptr, 0);
+    // Converts an already-NormalizeService()-validated ASCII string into the
+    // wide string used as part of the persisted KEK's name. Every byte in
+    // `normalized` is, by construction, ASCII alphanumeric or '.', so this
+    // conversion cannot actually fail today - MB_ERR_INVALID_CHARS and the
+    // resulting HKDFGUARD_ERR_INVALID_ARG are kept anyway as defense in
+    // depth, in case NormalizeService's contract ever changes without this
+    // call site being updated to match.
+    std::wstring ServiceToWide(const std::string &normalized) {
+        // Converting UTF-8 to UTF-16 (the std::wstring every NCrypt
+        // key-name parameter ultimately needs) is, like several other
+        // Windows APIs already seen in this project, a two-call "ask for
+        // the size, then convert for real" operation.
+        int wide_len = MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, normalized.c_str(), static_cast<int>(normalized.size()), nullptr, 0);
         if (wide_len <= 0) {
             throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "service is not valid UTF-8");
         }
-        // `std::string wide(static_cast<size_t>(wide_len), L'\0')` constructs a
-        // wide string of exactly `wide_len` characters, every one initially
-        // L'\0' - i.e. pre-allocates the right amount of storage for
-        // MultiByteToWideChar's second call to write its real output into via
-        // `wide.data()`.
+        // `std::wstring wide(static_cast<size_t>(wide_len), L'\0')`
+        // constructs a wide string of exactly `wide_len` characters, every
+        // one initially L'\0' - i.e. pre-allocates the right amount of
+        // storage for MultiByteToWideChar's second call to write its real
+        // output into via `wide.data()`.
         std::wstring wide(static_cast<size_t>(wide_len), L'\0');
-        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, service, static_cast<int>(len), wide.data(), wide_len);
+        MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, normalized.c_str(), static_cast<int>(normalized.size()), wide.data(),
+            wide_len);
         return wide;
+    }
+
+    // Convenience wrapper for callers (hkdfguard_kek_exists, hkdfguard_create_kek)
+    // that only need the normalized wide key-name form, not the normalized
+    // narrow form WrapDekCore/hkdfguard_unwrap_dek also need for AAD.
+    std::wstring ValidateAndConvertService(const char *service) {
+        return ServiceToWide(NormalizeService(service));
     }
 
     // The actual wrap orchestration shared by hkdfguard_wrap_dek (wraps a
@@ -122,7 +161,8 @@ namespace {
             return HKDFGUARD_ERR_BUFFER_TOO_SMALL;
         }
 
-        std::wstring service_name = ValidateAndConvertService(service);
+        std::string normalized_service = NormalizeService(service);
+        std::wstring service_name = ServiceToWide(normalized_service);
 
         // Opens this service's machine-wide persistent KEK, preferring the
         // TPM/vTPM-backed Platform Crypto Provider and falling back to the
@@ -160,15 +200,23 @@ namespace {
             DeriveWrappingKeyForWrap(kek.key.get(), ephemeral_pub, wrapping_key);
 
             // AES-256-GCM directly from the caller's dek pointer - no
-            // intermediate plaintext staging buffer. AAD is the caller's
-            // `service` string itself (raw UTF-8 bytes, not the wide
-            // NCrypt-key-name form `service_name` above): binds this
-            // ciphertext to the exact service it was wrapped for, matching
-            // this project's macOS and Linux implementations, which use the
-            // identical AAD for the identical reason.
+            // intermediate plaintext staging buffer. AAD is the
+            // case-normalized `normalized_service` bytes (not the caller's
+            // original-case `service`, and not the wide NCrypt-key-name form
+            // `service_name` above): binds this ciphertext to the exact
+            // (case-insensitive) service it was wrapped for, matching this
+            // project's macOS and Linux implementations, which use the
+            // identical AAD for the identical reason. Using the normalized
+            // form here - the same one ServiceToWide derived `service_name`
+            // from - is what makes wrap/unwrap genuinely case-insensitive
+            // end to end: if the raw `service` bytes were used instead, two
+            // calls that differ only in case would resolve to the same KEK
+            // but produce/expect different AAD, and unwrap would fail
+            // authentication.
             AesGcmEncrypt(
                 wrapping_key.data(), dek, static_cast<unsigned long>(dek_len),
-                reinterpret_cast<const uint8_t *>(service), static_cast<unsigned long>(strlen(service)),
+                reinterpret_cast<const uint8_t *>(normalized_service.data()),
+                static_cast<unsigned long>(normalized_service.size()),
                 nonce, ciphertext, tag);
         } // <- wrapping_key's destructor (zeroing it) runs here, right now.
 
@@ -281,7 +329,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
     uint8_t *out, int32_t *out_len) {
     // The entire body lives inside one `try` block: this is what makes it
     // possible for every internal helper WrapDekCore calls
-    // (ValidateAndConvertService, OpenKekForWrap,
+    // (NormalizeService, ServiceToWide, OpenKekForWrap,
     // DeriveWrappingKeyForWrap, AesGcmEncrypt, ...) to simply `throw
     // HkdfGuardError(...)` the moment something goes wrong, instead of
     // every one of them returning a code that this function would
@@ -428,7 +476,8 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
             return fail(HKDFGUARD_ERR_BUFFER_TOO_SMALL);
         }
 
-        std::wstring service_name = ValidateAndConvertService(service);
+        std::string normalized_service = NormalizeService(service);
+        std::wstring service_name = ServiceToWide(normalized_service);
 
         // Validates the payload's shape/version and hands back pointers
         // into `wrapped` for each field (see wire_format.h/.cpp) - throws
@@ -453,12 +502,14 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
 
             // Decrypt directly into the caller's buffer - no intermediate
             // plaintext staging buffer. AAD must match what AesGcmEncrypt
-            // used at wrap time: the same `service` string passed into
-            // this call.
+            // used at wrap time: the case-normalized `normalized_service`
+            // bytes (see WrapDekCore's comment on why the normalized form,
+            // not the caller's original-case `service`, is what's used).
             AesGcmDecrypt(
                 wrapping_key.data(), parsed.nonce, parsed.ciphertext,
                 static_cast<unsigned long>(kCiphertextLen),
-                reinterpret_cast<const uint8_t *>(service), static_cast<unsigned long>(strlen(service)),
+                reinterpret_cast<const uint8_t *>(normalized_service.data()),
+                static_cast<unsigned long>(normalized_service.size()),
                 parsed.tag, out);
         } // <- wrapping_key's destructor (zeroing it) runs here, right now.
 
