@@ -19,7 +19,17 @@ namespace hkdfguard {
     };
 
     //
-    // Ensures the KEK exists and is configured correctly.
+    // Reports whether the service's KEK already exists, per the effective
+    // TPM/software policy. Never creates or modifies a key.
+    //
+    // Throws HkdfGuardError on failure (a genuine provider error, not the
+    // key simply not existing).
+    //
+    bool KekExists(
+        const std::wstring& service);
+
+    //
+    // Creates the KEK if missing, or verifies it if present.
     //
     // Responsibilities:
     //
@@ -33,7 +43,7 @@ namespace hkdfguard {
     //
     // Throws HkdfGuardError on failure.
     //
-    void EnsureKek(
+    void CreateKek(
         const std::wstring& service,
         const std::vector<std::wstring>& aclGroups);
 
@@ -42,7 +52,7 @@ namespace hkdfguard {
     //
     // Never creates a key.
     //
-    // Intended for runtime use after EnsureKek()
+    // Intended for runtime use after CreateKek()
     // has completed provisioning.
     //
     ResolvedKek OpenKekForWrap(

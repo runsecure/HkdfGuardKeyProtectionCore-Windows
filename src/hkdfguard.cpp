@@ -36,6 +36,7 @@ using namespace hkdfguard;
 // what this construct does).
 namespace {
     constexpr size_t kMaxServiceLen = 128; // bytes, excluding the null terminator
+    constexpr size_t kMaxGroupsCsvLen = 8192; // bytes, excluding the null terminator
 
     // Validates that the incoming servicename is alphanumeric or period(dot)
     bool IsValidServiceChar(char c) noexcept {
@@ -123,12 +124,12 @@ namespace {
 
         std::wstring service_name = ValidateAndConvertService(service);
 
-        // Resolve (create if necessary) this service's machine-wide persistent
-        // KEK, preferring the TPM/vTPM-backed Platform Crypto Provider and
-        // falling back to the Software Key Storage Provider automatically.
-        // Creating it for the first time requires this process to be elevated
-        // (see kek_store.h/.cpp) - by design, for a deployment-time wrap step
-        // ahead of a separate account unwrapping later.
+        // Opens this service's machine-wide persistent KEK, preferring the
+        // TPM/vTPM-backed Platform Crypto Provider and falling back to the
+        // Software Key Storage Provider automatically. Never creates one -
+        // hkdfguard_create_kek must have already provisioned it (see
+        // kek_store.h/.cpp) - so this fails with HKDFGUARD_ERR_PROVIDER if
+        // the service has no KEK yet.
         ResolvedKek kek = OpenKekForWrap(service_name);
 
         // Ephemeral ECDH + HKDF-SHA512 -> 32-byte AES wrapping key. Only the
@@ -179,6 +180,18 @@ namespace {
         return HKDFGUARD_OK;
     }
 
+    // Strips leading/trailing ASCII whitespace from `s`, so callers can write
+    // "group1, group2 , group3" without the surrounding spaces becoming part
+    // of the group name.
+    std::string Trim(const std::string &s) {
+        size_t begin = s.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) {
+            return "";
+        }
+        size_t end = s.find_last_not_of(" \t\r\n");
+        return s.substr(begin, end - begin + 1);
+    }
+
     std::vector<std::wstring> ParseAndConvertGroups(
         const char *groups_csv) {
         std::vector<std::wstring> result;
@@ -187,7 +200,19 @@ namespace {
             return result;
         }
 
-        std::string csv(groups_csv);
+        // Same strnlen-based bound as ValidateAndConvertService above, for the
+        // same reason: `groups_csv` is just a raw pointer with no length
+        // parameter alongside it, so this bounds how far this code ever reads
+        // in case the caller passed a buffer that isn't null-terminated
+        // within any reasonable length.
+        size_t len = strnlen(groups_csv, kMaxGroupsCsvLen + 1);
+        if (len > kMaxGroupsCsvLen) {
+            throw HkdfGuardError(
+                HKDFGUARD_ERR_INVALID_ARG,
+                "groups_csv is too long");
+        }
+
+        std::string csv(groups_csv, len);
 
         size_t start = 0;
 
@@ -195,9 +220,10 @@ namespace {
             size_t comma = csv.find(',', start);
 
             std::string token =
-                    (comma == std::string::npos)
-                        ? csv.substr(start)
-                        : csv.substr(start, comma - start);
+                    Trim(
+                        (comma == std::string::npos)
+                            ? csv.substr(start)
+                            : csv.substr(start, comma - start));
 
             if (!token.empty()) {
                 int wide_len =
@@ -241,11 +267,11 @@ namespace {
     }
 } // namespace
 
-// `extern "C"` here (repeated at each function, rather than wrapping both
-// in one block) matches how hkdfguard.h declared them, and is required for
-// the same reason explained there: it gives these two functions the plain,
-// unmangled names ("hkdfguard_wrap_dek"/"hkdfguard_unwrap_dek") that other
-// languages' FFI layers look up by exact string. HKDFGUARD_API expands to
+// `extern "C"` here (repeated at each function, rather than wrapping all of
+// them in one block) matches how hkdfguard.h declared them, and is required
+// for the same reason explained there: it gives each of these functions the
+// plain, unmangled name (e.g. "hkdfguard_wrap_dek") that other languages'
+// FFI layers look up by exact string. HKDFGUARD_API expands to
 // __declspec(dllexport) here specifically because CMakeLists.txt defines
 // HKDFGUARD_EXPORTS only while compiling this DLL's own sources (see
 // hkdfguard.h's comment on that macro).
@@ -255,7 +281,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
     uint8_t *out, int32_t *out_len) {
     // The entire body lives inside one `try` block: this is what makes it
     // possible for every internal helper WrapDekCore calls
-    // (ValidateAndConvertService, ResolveOrCreateKekForWrap,
+    // (ValidateAndConvertService, OpenKekForWrap,
     // DeriveWrappingKeyForWrap, AesGcmEncrypt, ...) to simply `throw
     // HkdfGuardError(...)` the moment something goes wrong, instead of
     // every one of them returning a code that this function would
@@ -283,7 +309,28 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
     }
 }
 
-extern "C" HKDFGUARD_API int32_t hkdfguard_ensure_kek(
+extern "C" HKDFGUARD_API int32_t hkdfguard_kek_exists(
+    const char *service,
+    int32_t *out_exists) {
+    if (out_exists == nullptr) {
+        return HKDFGUARD_ERR_INVALID_ARG;
+    }
+
+    try {
+        std::wstring service_name =
+                ValidateAndConvertService(service);
+
+        *out_exists = KekExists(service_name) ? 1 : 0;
+
+        return HKDFGUARD_OK;
+    } catch (const HkdfGuardError &e) {
+        return e.code();
+    } catch (...) {
+        return HKDFGUARD_ERR_INTERNAL;
+    }
+}
+
+extern "C" HKDFGUARD_API int32_t hkdfguard_create_kek(
     const char *service,
     const char *groups_csv) {
     try {
@@ -293,7 +340,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_ensure_kek(
         std::vector<std::wstring> groups =
                 ParseAndConvertGroups(groups_csv);
 
-        EnsureKek(
+        CreateKek(
             service_name,
             groups);
 

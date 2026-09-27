@@ -31,10 +31,31 @@ namespace hkdfguard {
         constexpr KeyStoragePolicy kDefaultPolicy =
             KeyStoragePolicy::PreferTpm;
 
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+        // See SetTestPolicyOverride/LoadEffectivePolicy in policy.h. Empty by
+        // default, so a test binary that never calls SetTestPolicyOverride
+        // still falls through to the real registry read below.
+        std::optional<KeyStoragePolicy> g_testPolicyOverride;
+#endif
+
     } // namespace
+
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+    void SetTestPolicyOverride(std::optional<KeyStoragePolicy> policy) noexcept
+    {
+        g_testPolicyOverride = policy;
+    }
+#endif
 
     KeyStoragePolicy LoadEffectivePolicy() noexcept
     {
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+        if (g_testPolicyOverride.has_value())
+        {
+            return *g_testPolicyOverride;
+        }
+#endif
+
         HKEY key = nullptr;
 
         LONG status = RegOpenKeyExW(

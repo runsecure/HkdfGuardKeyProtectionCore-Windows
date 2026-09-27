@@ -93,7 +93,35 @@ extern "C" {
 #define HKDFGUARD_ERR_SERVICE_NAME_INVALID (-8) /* Service Name is malformed or invalid */
 #define HKDFGUARD_ERR_INVALID_POLICY   (-9) /* Invalid Key Storage Policy Flag */
 
-HKDFGUARD_API int32_t hkdfguard_ensure_kek(
+/*
+ * Reports whether a persistent KEK already exists for `service`, without
+ * creating or modifying anything.
+ *
+ * service     - see hkdfguard_wrap_dek.
+ * out_exists  - caller-owned output. On success, set to 1 if the KEK exists,
+ *               0 otherwise.
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ * *out_exists is left untouched on failure.
+ */
+HKDFGUARD_API int32_t hkdfguard_kek_exists(
+    const char* service,
+    int32_t* out_exists);
+
+/*
+ * Creates the persistent KEK for `service` if it does not already exist, or
+ * verifies its properties if it does. Safe to call more than once for the
+ * same service.
+ *
+ * service     - see hkdfguard_wrap_dek.
+ * groups_csv  - comma-separated list of group names to grant unwrap/use
+ *               access to. May be null or empty for no additional groups.
+ *               Whitespace around each name is trimmed. At most 8192 bytes
+ *               (excluding the null terminator).
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ */
+HKDFGUARD_API int32_t hkdfguard_create_kek(
     const char* service,
     const char* groups_csv);
 
@@ -107,6 +135,8 @@ HKDFGUARD_API int32_t hkdfguard_ensure_kek(
  *             a payload produced with it; the service name itself is not
  *             recorded in the wrapped payload. Must be non-null, non-empty,
  *             and at most 128 bytes (excluding the null terminator).
+ *             hkdfguard_create_kek must have already provisioned this
+ *             service's KEK; this function never creates one.
  * dek       - pointer to exactly HKDFGUARD_DEK_LEN bytes of plaintext DEK.
  * dek_len   - must equal HKDFGUARD_DEK_LEN.
  * out       - caller-owned output buffer.
@@ -114,7 +144,8 @@ HKDFGUARD_API int32_t hkdfguard_ensure_kek(
  *             out: on success, the number of bytes written (always
  *             HKDFGUARD_WRAPPED_LEN).
  *
- * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code
+ * (including HKDFGUARD_ERR_PROVIDER if the service has no KEK yet).
  * On failure, no partial output is left in the caller's buffer.
 */
 

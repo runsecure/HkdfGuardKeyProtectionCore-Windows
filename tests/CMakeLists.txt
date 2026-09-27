@@ -24,6 +24,12 @@ target_include_directories(test_roundtrip PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
 )
+# Enables policy.h/.cpp's SetTestPolicyOverride seam (see policy.h) in this
+# target's own compiled copy of policy.cpp only. The hkdfguard DLL target in
+# the parent CMakeLists.txt never defines this macro, so its own separate
+# compiled copy of policy.cpp has no such function, and no override state,
+# at all - the seam does not exist in shipped release code.
+target_compile_definitions(test_roundtrip PRIVATE HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
 
 # Registers test_roundtrip.exe as a CTest test named "roundtrip" - what
 # `ctest` (see README.md) actually runs.
