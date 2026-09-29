@@ -1,33 +1,41 @@
-// CLI tool: wraps a caller-supplied Data Encryption Key (DEK) under a
-// persistent, machine-wide, TPM-backed (or software-fallback) KEK and
-// writes the wrapped payload to a file.
+// CLI tool: provisions a service's machine-wide KEK, and separately wraps a
+// caller-supplied Data Encryption Key (DEK) under an already-provisioned
+// KEK, writing the wrapped payload to a file.
 //
-// Calls into hkdfguard.dll through its stable C ABI - hkdfguard_kek_exists
-// and hkdfguard_create_kek to provision the service's machine-wide KEK on
-// first use, then hkdfguard_wrap_dek - the same interface any
+// Two subcommands, strictly separated:
+//
+//   provision --service-name|-sn <name>
+//       Calls hkdfguard_kek_exists, then hkdfguard_create_kek if the KEK
+//       does not already exist. Never wraps a DEK, never touches a file.
+//       This is the *only* subcommand that may create a KEK.
+//
+//   wrap --key-file-path|-kf <path> --service-name|-sn <name> \
+//        --dek-stdin --group|-g <name> [--force|-f]
+//       Calls hkdfguard_wrap_dek against the service's *existing* KEK and
+//       writes the wrapped payload to <path>. Never provisions a KEK - if
+//       none exists yet for this service, this fails with KEK_NOT_FOUND and
+//       a hint to run "provision" first. The DEK (32 raw bytes,
+//       base64-encoded) is read from stdin rather than a command-line
+//       argument, specifically so it never appears in this process's argv -
+//       and is therefore not visible to other processes on the same host
+//       via a command-line/process listing (e.g. a WMI query) for the life
+//       of this process, unlike a plain --dek=<value> argument would be.
+//
+// Calls into hkdfguard.dll through its stable C ABI - hkdfguard_kek_exists,
+// hkdfguard_create_kek, and hkdfguard_wrap_dek - the same interface any
 // other-language caller uses; this tool links only against
 // include/hkdfguard.h and the hkdfguard import library, nothing from src/.
-// Mirrors this project's macOS and Linux equivalents
-// (hkdfguard-v1-initialize) argument-for-argument, with one Windows-only
-// addition: --group|-g. Windows has no POSIX-style implicit "group" the
-// way 0640 relies on for those two platforms, so the caller names one
-// explicitly here instead.
 //
 // The KEK's `service` identity is exactly --service-name's value, passed
-// straight through to the hkdfguard_* calls as `service`. The KEK itself
-// is meant to be long-lived: DEKs are re-minted every release under the
-// same service name, and if a genuinely new KEK is ever wanted, the
-// service name is simply versioned (e.g. "myapp.v2") - there is no in-place
-// key rotation. Creating a KEK (the first run for a given service name)
-// needs an elevated process; wrapping against an existing one does not,
+// straight through to the hkdfguard_* calls as `service`, and shared
+// between the two subcommands - "provision" and "wrap" for the same
+// service name operate on the same KEK. The KEK itself is meant to be
+// long-lived: DEKs are re-minted every release under the same service
+// name, and if a genuinely new KEK is ever wanted, the service name is
+// simply versioned (e.g. "myapp.v2") - there is no in-place key rotation.
+// Creating a KEK (provision, the first run for a given service name) needs
+// an elevated process; wrapping against an existing one (wrap) does not,
 // subject to the key's ACL.
-//
-// Usage:
-//   hkdfguard-v1-initialize <key-file-path> \
-//       --service-name|-sn <name> \
-//       --dek|-d <base64> \
-//       --group|-g <name> \
-//       [--force|-f]
 //
 // The wrapped payload is written to <key-file-path> with an explicit,
 // non-inherited DACL: the calling account (the process token's owner SID)
@@ -35,7 +43,11 @@
 // granted anything - the Windows analog of this project's macOS/Linux
 // tools' POSIX 0640 (owner rw, one group r, no one else). Set atomically
 // at file-creation time via CreateFileW's own security-attributes
-// parameter, not applied after the fact.
+// parameter, not applied after the fact. --group is a "wrap"-only concept:
+// it governs the wrapped-key *file's* ACL, not the KEK's - which principals
+// may use the KEK is a separate, machine-level registry policy
+// (KeyUseGroups; see include/hkdfguard.h), not something either subcommand
+// accepts on the command line.
 //
 // With --force against a pre-existing file, that file's old contents are
 // securely overwritten in place (8 alternating all-zero/random passes,
@@ -45,11 +57,6 @@
 // project's macOS implementation pass-for-pass. Only ever runs when
 // --force is passed; without it, an existing file is never touched at all
 // (WriteWrappedKeyFile's plain CREATE_NEW fails outright instead).
-//
-// Note: --dek on the command line is visible to other processes on the
-// same host (e.g. via a WMI process/command-line query) for the life of
-// this process, like any command-line argument. That's a general
-// limitation of passing secrets on argv, not specific to this tool.
 
 #include "hkdfguard.h"
 
@@ -72,6 +79,11 @@
 
 namespace {
     constexpr wchar_t kProgramName[] = L"hkdfguard-v1-initialize";
+    // Narrow-string twin of kProgramName, for use in narrow (std::string)
+    // error/hint text - everything in this tool that isn't a PrintUsage-style
+    // fwprintf is narrow, matching the non-UNICODE Win32 API variants and
+    // std::string this tool uses throughout.
+    constexpr char kProgramNameNarrow[] = "hkdfguard-v1-initialize";
     constexpr size_t kDekLen = 32;
     // Generous starting capacity for the wrapped payload - retried once at the
     // library-reported size on HKDFGUARD_ERR_BUFFER_TOO_SMALL, so this only
@@ -162,12 +174,16 @@ namespace {
 
     // MARK: - Argument parsing
 
-    struct Args {
+    struct ProvisionArgs {
+        std::string serviceName;
+    };
+
+    struct WrapArgs {
         std::string keyFilePath;
         std::string serviceName;
-        std::string dekBase64;
         std::string groupName;
         bool force = false;
+        bool dekStdin = false;
     };
 
     enum class ParseOutcome { Run, Help };
@@ -175,27 +191,55 @@ namespace {
     void PrintUsage() {
         fwprintf(
             stderr,
-            L"Usage: %ls <key-file-path> --service-name|-sn <name> "
-            L"--dek|-d <base64> --group|-g <name> [--force|-f]\n",
+            L"Usage:\n"
+            L"  %ls provision --service-name|-sn <name>\n"
+            L"  %ls wrap --key-file-path|-kf <path> --service-name|-sn <name> "
+            L"--dek-stdin --group|-g <name> [--force|-f]\n"
+            L"\n"
+            L"The DEK for \"wrap\" is 32 raw bytes, base64-encoded, read from stdin.\n"
+            L"Run \"%ls provision --help\" or \"%ls wrap --help\" for details.\n",
+            kProgramName, kProgramName, kProgramName, kProgramName);
+    }
+
+    void PrintProvisionUsage() {
+        fwprintf(
+            stderr,
+            L"Usage: %ls provision --service-name|-sn <name>\n"
+            L"\n"
+            L"Ensures the named service's machine-wide KEK exists: calls\n"
+            L"hkdfguard_kek_exists, then hkdfguard_create_kek if it does not\n"
+            L"already exist. Never wraps a DEK, never touches a file. Creating a\n"
+            L"new KEK requires an elevated process; confirming an existing one\n"
+            L"does not.\n",
             kProgramName);
+    }
+
+    void PrintWrapUsage() {
+        fwprintf(
+            stderr,
+            L"Usage: %ls wrap --key-file-path|-kf <path> --service-name|-sn <name> "
+            L"--dek-stdin --group|-g <name> [--force|-f]\n"
+            L"\n"
+            L"Wraps the DEK (32 raw bytes, base64-encoded, read from stdin) under\n"
+            L"the named service's existing machine-wide KEK and writes the\n"
+            L"wrapped payload to <path>. Never creates a KEK - run\n"
+            L"\"%ls provision --service-name|-sn <name>\" first if one does not\n"
+            L"yet exist for this service.\n",
+            kProgramName, kProgramName);
     }
 
     // Throws CliError on any parse failure; returns ParseOutcome::Help if
     // --help/-h was seen (in which case `out` is left unpopulated - the caller
-    // must check the return value before using `out`).
-    ParseOutcome ParseArgs(int argc, char *argv[], Args &out) {
-        std::optional<std::string> keyFilePath;
+    // must check the return value before using `out`). Starts at argv[2] -
+    // argv[1] is the subcommand name, already consumed by main() to dispatch
+    // here.
+    ParseOutcome ParseProvisionArgs(int argc, char *argv[], ProvisionArgs &out) {
         std::optional<std::string> serviceName;
-        std::optional<std::string> dekBase64;
-        std::optional<std::string> groupName;
-        bool force = false;
 
-        for (int i = 1; i < argc; ++i) {
+        for (int i = 2; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
                 return ParseOutcome::Help;
-            } else if (arg == "--force" || arg == "-f") {
-                force = true;
             } else if (arg == "--service-name" || arg == "-sn") {
                 if (i + 1 >= argc) {
                     throw CliError(arg + " requires a value");
@@ -205,11 +249,51 @@ namespace {
                     throw CliError("--service-name must not be empty");
                 }
                 serviceName = value;
-            } else if (arg == "--dek" || arg == "-d") {
+            } else {
+                throw CliError("unrecognized argument: " + arg);
+            }
+        }
+
+        if (!serviceName) throw CliError("missing required --service-name|-sn");
+
+        out.serviceName = *serviceName;
+        return ParseOutcome::Run;
+    }
+
+    // Same argv[2]-onward convention as ParseProvisionArgs above.
+    ParseOutcome ParseWrapArgs(int argc, char *argv[], WrapArgs &out) {
+        std::optional<std::string> keyFilePath;
+        std::optional<std::string> serviceName;
+        std::optional<std::string> groupName;
+        bool force = false;
+        bool dekStdin = false;
+
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                return ParseOutcome::Help;
+            } else if (arg == "--force" || arg == "-f") {
+                force = true;
+            } else if (arg == "--dek-stdin") {
+                dekStdin = true;
+            } else if (arg == "--key-file-path" || arg == "-kf") {
                 if (i + 1 >= argc) {
                     throw CliError(arg + " requires a value");
                 }
-                dekBase64 = argv[++i];
+                std::string value = argv[++i];
+                if (value.empty()) {
+                    throw CliError("--key-file-path must not be empty");
+                }
+                keyFilePath = value;
+            } else if (arg == "--service-name" || arg == "-sn") {
+                if (i + 1 >= argc) {
+                    throw CliError(arg + " requires a value");
+                }
+                std::string value = argv[++i];
+                if (value.empty()) {
+                    throw CliError("--service-name must not be empty");
+                }
+                serviceName = value;
             } else if (arg == "--group" || arg == "-g") {
                 if (i + 1 >= argc) {
                     throw CliError(arg + " requires a value");
@@ -219,50 +303,71 @@ namespace {
                     throw CliError("--group must not be empty");
                 }
                 groupName = value;
-            } else if (!keyFilePath.has_value() && (arg.empty() || arg[0] != L'-')) {
-                keyFilePath = arg;
             } else {
                 throw CliError("unrecognized argument: " + arg);
             }
         }
 
-        if (!keyFilePath) throw CliError("missing required <key-file-path>");
+        if (!keyFilePath) throw CliError("missing required --key-file-path|-kf");
         if (!serviceName) throw CliError("missing required --service-name|-sn");
-        if (!dekBase64) throw CliError("missing required --dek|-d");
         if (!groupName) throw CliError("missing required --group|-g");
+        if (!dekStdin) {
+            throw CliError("missing required --dek-stdin (the DEK must be provided as base64 text on stdin)");
+        }
 
         out.keyFilePath = *keyFilePath;
         out.serviceName = *serviceName;
-        out.dekBase64 = *dekBase64;
         out.groupName = *groupName;
         out.force = force;
+        out.dekStdin = dekStdin;
         return ParseOutcome::Run;
     }
 
-    // MARK: - Base64 / UTF-8 conversion
+    // MARK: - Base64 / stdin
 
     // Decodes `input` (standard base64) into raw bytes via CNG's Crypt32
     // string-conversion API - no third-party dependency needed, matching this
     // project's general preference for native platform APIs over external
-    // crates/packages.
+    // crates/packages. CRYPT_STRING_BASE64 tolerates embedded whitespace
+    // (spaces, tabs, CR, LF), so a trailing newline from how `input` was
+    // produced (e.g. piped from a shell) needs no separate trimming here.
     std::vector<BYTE> Base64Decode(const std::string &input) {
         DWORD size = 0;
         if (!CryptStringToBinary(
             input.c_str(), static_cast<DWORD>(input.size()), CRYPT_STRING_BASE64, nullptr, &size, nullptr,
             nullptr)) {
-            throw CliError("--dek is not valid base64: " + FormatWin32Error(GetLastError()));
+            throw CliError("DEK is not valid base64: " + FormatWin32Error(GetLastError()));
         }
         std::vector<BYTE> out(size);
         if (!CryptStringToBinary(
             input.c_str(), static_cast<DWORD>(input.size()), CRYPT_STRING_BASE64, out.data(), &size, nullptr,
             nullptr)) {
-            throw CliError("--dek is not valid base64: " + FormatWin32Error(GetLastError()));
+            throw CliError("DEK is not valid base64: " + FormatWin32Error(GetLastError()));
         }
         out.resize(size);
         return out;
     }
 
-    // MARK: - Wrap
+    // Reads all of stdin (expected to be base64 text for the DEK) into a
+    // std::string. Used only by "wrap --dek-stdin", specifically so the DEK
+    // never appears in this process's argv - see this file's header comment.
+    std::string ReadDekBase64FromStdin() {
+        std::string result;
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) {
+            result.append(buf, n);
+        }
+        if (ferror(stdin)) {
+            throw CliError("failed to read DEK from stdin");
+        }
+        if (result.empty()) {
+            throw CliError("no data read from stdin for --dek-stdin");
+        }
+        return result;
+    }
+
+    // MARK: - Wrap / provision
 
     std::string DescribeStatus(int32_t code) {
         switch (code) {
@@ -286,7 +391,9 @@ namespace {
 
     // Calls hkdfguard_wrap_dek, retrying once at the library-reported required
     // size if the initial buffer was too small - same pattern as the
-    // macOS/Linux tools' own wrap helper.
+    // macOS/Linux tools' own wrap helper. Never provisions a KEK - a missing
+    // KEK surfaces as HKDFGUARD_ERR_KEK_NOT_FOUND, with a hint pointing at
+    // this tool's "provision" subcommand.
     std::vector<uint8_t> WrapDek(const std::string &service, const std::vector<BYTE> &dek) {
         std::vector<uint8_t> wrapped(static_cast<size_t>(kInitialWrappedCapacity));
         int32_t wrappedLen = static_cast<int32_t>(wrapped.size());
@@ -302,7 +409,12 @@ namespace {
         }
 
         if (rc != HKDFGUARD_OK) {
-            throw CliError("hkdfguard_wrap_dek failed: " + DescribeStatus(rc));
+            std::string message = "hkdfguard_wrap_dek failed: " + DescribeStatus(rc);
+            if (rc == HKDFGUARD_ERR_KEK_NOT_FOUND) {
+                message += std::string(" (run \"") + kProgramNameNarrow +
+                           " provision --service-name " + service + "\" first)";
+            }
+            throw CliError(message);
         }
 
         wrapped.resize(static_cast<size_t>(wrappedLen));
@@ -310,14 +422,13 @@ namespace {
     }
 
     // Makes sure the service's machine-wide KEK exists, creating it if not.
-    // hkdfguard_wrap_dek never creates a KEK, so a first deployment for a
-    // new service name must provision it here. Called only after every
-    // argument (including --dek) has been validated, since creating a KEK
-    // is a persistent side effect that a later argument error must not
-    // leave behind. A provisioning failure is typically "not elevated" or
-    // a rejected KeyUseGroups policy entry. Which principals may later
-    // unwrap, and whether the KEK is TPM- or software-backed, come from the
-    // machine's registry policy, not from this tool - see include/hkdfguard.h.
+    // This is "provision"'s entire job - hkdfguard_wrap_dek never creates a
+    // KEK, so a service's first deployment must provision one here before
+    // "wrap" is ever run for it. A provisioning failure is typically "not
+    // elevated" or a rejected KeyUseGroups policy entry. Which principals may
+    // later unwrap, and whether the KEK is TPM- or software-backed, come from
+    // the machine's registry policy, not from this tool - see
+    // include/hkdfguard.h.
     void EnsureKekProvisioned(const std::string &service) {
         int32_t exists = 0;
         int32_t rc = hkdfguard_kek_exists(service.c_str(), &exists);
@@ -645,9 +756,18 @@ namespace {
         }
     }
 
-    // MARK: - Run
+    // MARK: - Run: provision
 
-    void Run(Args &args) {
+    void RunProvision(const ProvisionArgs &args) {
+        // `service` is not secret -- it's a logical identifier, not key
+        // material.
+        ValidateServiceCharset(args.serviceName);
+        EnsureKekProvisioned(args.serviceName);
+    }
+
+    // MARK: - Run: wrap
+
+    void RunWrap(WrapArgs &args) {
         // Fast, friendly pre-check: fail before ever touching the TPM/Software
         // Key Storage Provider if the output path obviously already exists and
         // --force wasn't passed. WriteWrappedKeyFile's CREATE_NEW is the actual
@@ -674,39 +794,34 @@ namespace {
 
         std::vector<uint8_t> wrapped;
         {
-            // Both the base64 *text* (`args.dekBase64`) and the decoded
+            // Both the base64 *text* read from stdin and the decoded
             // plaintext DEK *bytes* (`dek`) are secret, and both are scoped as
             // tightly as possible around exactly the statements that need
-            // them: decode, wipe the text immediately (it has now served its
-            // one purpose), validate the byte length, wrap, then `dek` is
+            // them: read+decode, wipe the text immediately (it has now served
+            // its one purpose), validate the byte length, wrap, then `dek` is
             // wiped by `dekGuard` the instant this block ends -- immediately
-            // after WrapDek is done with it, not at the end of Run() (which
-            // would otherwise leave it sitting in memory, unused but unwiped,
-            // through --group resolution above, and through the ACL work,
-            // the potentially-slow 8-pass secure-overwrite, and the final
-            // file write below). Matches the "shrink the scope to shrink the
-            // lifetime" technique this project's own DLL uses for the exact
-            // same reason (e.g. hkdfguard.cpp's `wrapping_key`, ecdh_hkdf.cpp's
-            // `prk`/`t1`) -- hkdfguard_wrap_dek itself reads the plaintext DEK
-            // directly from whatever pointer it's given and never copies or
-            // zeroes it internally (see aes_gcm.cpp's own comment on this),
-            // so this caller-side zeroing is not optional defense-in-depth --
-            // it is the only place this ever happens at all.
-            std::vector<BYTE> dek = Base64Decode(args.dekBase64);
+            // after WrapDek is done with it, not at the end of RunWrap()
+            // (which would otherwise leave it sitting in memory, unused but
+            // unwiped, through the potentially-slow 8-pass secure-overwrite
+            // and the final file write below). Matches the "shrink the scope
+            // to shrink the lifetime" technique this project's own DLL uses
+            // for the exact same reason (e.g. hkdfguard.cpp's `wrapping_key`,
+            // ecdh_hkdf.cpp's `prk`/`t1`) -- hkdfguard_wrap_dek itself reads
+            // the plaintext DEK directly from whatever pointer it's given and
+            // never copies or zeroes it internally (see aes_gcm.cpp's own
+            // comment on this), so this caller-side zeroing is not optional
+            // defense-in-depth -- it is the only place this ever happens at
+            // all.
+            std::string dekBase64 = ReadDekBase64FromStdin();
+            std::vector<BYTE> dek = Base64Decode(dekBase64);
 
             // The base64 text has now served its only purpose: wipe this
-            // process's one owned copy of it right here, rather than leaving
-            // it sitting in `args` for the rest of this function (or, without
-            // this, for the rest of the process's life until `args` is
-            // eventually destroyed -- and a plain std::string destructor
-            // does not zero its buffer, it only deallocates it). This does
-            // not erase the original command-line argument the OS/CRT still
-            // holds elsewhere -- see this file's header comment on that
-            // inherent, unavoidable argv-visibility limitation -- it erases
-            // the one copy this code actually controls, which is the one
-            // thing zeroing it here can actually fix.
-            SecureZeroMemory(args.dekBase64.data(), args.dekBase64.size());
-            args.dekBase64.clear();
+            // process's one owned copy of it right here rather than leaving
+            // it sitting around, unused but unwiped, until dekBase64's
+            // destructor runs (which does not zero its buffer, it only
+            // deallocates it).
+            SecureZeroMemory(dekBase64.data(), dekBase64.size());
+            dekBase64.clear();
 
             // Zeroes `dek` -- up to its *capacity*, not just its current
             // size -- the instant this block ends, on every exit path (the
@@ -729,17 +844,14 @@ namespace {
 
             if (dek.size() != kDekLen) {
                 throw CliError(
-                    "--dek must decode to exactly " + std::to_string(kDekLen) + " bytes, got " +
+                    "DEK must decode to exactly " + std::to_string(kDekLen) + " bytes, got " +
                     std::to_string(dek.size()));
             }
 
-            // Provision (or confirm) the KEK only now - after every argument
-            // has been validated - because creating a KEK is a persistent,
-            // machine-wide side effect: a malformed --dek must not leave a
-            // freshly-created KEK behind. `dek` stays in memory for the one
-            // extra NCrypt call this costs, still under dekGuard's wipe.
-            EnsureKekProvisioned(service);
-
+            // No provisioning happens here - "wrap" only ever opens an
+            // existing KEK. If none exists yet for this service, WrapDek's
+            // HKDFGUARD_ERR_KEK_NOT_FOUND path below reports that and points
+            // at "provision".
             wrapped = WrapDek(service, dek);
             // dekGuard zeroes `dek` here, as this block ends -- immediately
             // after WrapDek returns the wrapped (encrypted, no longer secret)
@@ -759,26 +871,68 @@ namespace {
 } // namespace
 
 int main(int argc, char *argv[]) {
-    Args args;
-    try {
-        if (ParseArgs(argc, argv, args) == ParseOutcome::Help) {
-            PrintUsage();
-            return 0;
-        }
-    } catch (const CliError &e) {
-        fprintf(stderr, "error: %s\n", e.message.c_str());
+    if (argc < 2) {
         PrintUsage();
         return 2;
     }
 
-    try {
-        Run(args);
+    std::string command = argv[1];
+    if (command == "--help" || command == "-h") {
+        PrintUsage();
         return 0;
-    } catch (const CliError &e) {
-        fprintf(stderr, "error: %s\n", e.message.c_str());
-        return 1;
-    } catch (const std::exception &e) {
-        fprintf(stderr, "error: %hs\n", e.what());
-        return 1;
     }
+
+    if (command == "provision") {
+        ProvisionArgs args;
+        try {
+            if (ParseProvisionArgs(argc, argv, args) == ParseOutcome::Help) {
+                PrintProvisionUsage();
+                return 0;
+            }
+        } catch (const CliError &e) {
+            fprintf(stderr, "error: %s\n", e.message.c_str());
+            PrintProvisionUsage();
+            return 2;
+        }
+
+        try {
+            RunProvision(args);
+            return 0;
+        } catch (const CliError &e) {
+            fprintf(stderr, "error: %s\n", e.message.c_str());
+            return 1;
+        } catch (const std::exception &e) {
+            fprintf(stderr, "error: %hs\n", e.what());
+            return 1;
+        }
+    }
+
+    if (command == "wrap") {
+        WrapArgs args;
+        try {
+            if (ParseWrapArgs(argc, argv, args) == ParseOutcome::Help) {
+                PrintWrapUsage();
+                return 0;
+            }
+        } catch (const CliError &e) {
+            fprintf(stderr, "error: %s\n", e.message.c_str());
+            PrintWrapUsage();
+            return 2;
+        }
+
+        try {
+            RunWrap(args);
+            return 0;
+        } catch (const CliError &e) {
+            fprintf(stderr, "error: %s\n", e.message.c_str());
+            return 1;
+        } catch (const std::exception &e) {
+            fprintf(stderr, "error: %hs\n", e.what());
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "error: unrecognized command \"%s\"\n", command.c_str());
+    PrintUsage();
+    return 2;
 }

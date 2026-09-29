@@ -113,8 +113,8 @@ if ($LASTEXITCODE -eq 0) {
     Write-Bad "ctest: one or more tests failed (exit $LASTEXITCODE) - see output above"
 }
 
-# ---- CLI wrap + independent DLL unwrap verification ----------------------
-Write-Section "CLI wrap + DLL unwrap round-trip verification"
+# ---- CLI provision + wrap + independent DLL unwrap verification ----------
+Write-Section "CLI provision + wrap + DLL unwrap round-trip verification"
 
 $verifyDir = Join-Path $RepoRoot "build\verify"
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
@@ -124,7 +124,7 @@ $keyFile = Join-Path $verifyDir "verify.key"
 $serviceName = "hkdfguardverifyscript"
 $service = $serviceName
 
-# 32 cryptographically random bytes, base64-encoded for the CLI's --dek flag.
+# 32 cryptographically random bytes, base64-encoded for "wrap --dek-stdin".
 $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 $dekBytes = New-Object byte[] 32
 $rng.GetBytes($dekBytes)
@@ -132,25 +132,43 @@ $dekBase64 = [Convert]::ToBase64String($dekBytes)
 
 if (Test-Path $keyFile) { Remove-Item -Force $keyFile }
 
-Write-Host "Wrapping a random 32-byte DEK via the CLI (service '$service')..."
 # hkdfguard-v1-initialize.exe (build\tools\) links against hkdfguard.dll
 # (build\), a different directory - Windows won't find the DLL by default,
-# so prepend its directory to PATH for this one process, same as
+# so prepend its directory to PATH for both calls below, same as
 # tests/CMakeLists.txt already does for ctest via ENVIRONMENT PATH.
 $dllDir = Split-Path -Parent $dllPath
 $oldPath = $env:PATH
 $env:PATH = "$dllDir;$env:PATH"
 try {
-    & $cliPath $keyFile --service-name $serviceName `
-        --dek $dekBase64 --group $Group --force
-    $cliExit = $LASTEXITCODE
+    Write-Host "Provisioning the KEK for service '$service'..."
+    & $cliPath provision --service-name $serviceName
+    $provisionExit = $LASTEXITCODE
+    if ($provisionExit -ne 0) {
+        Write-Bad "hkdfguard-v1-initialize.exe provision exited $provisionExit"
+    } else {
+        Write-Ok "KEK provisioned for service '$service'"
+    }
+
+    if ($provisionExit -eq 0) {
+        Write-Host "Wrapping a random 32-byte DEK via the CLI (service '$service')..."
+        # The DEK is fed to "wrap" as base64 text on stdin (--dek-stdin), not
+        # as a command-line argument - see hkdfguard-v1-initialize.cpp's
+        # header comment on why.
+        $dekBase64 | & $cliPath wrap --key-file-path $keyFile --service-name $serviceName `
+            --dek-stdin --group $Group --force
+        $cliExit = $LASTEXITCODE
+    } else {
+        $cliExit = $provisionExit
+    }
 } finally {
     $env:PATH = $oldPath
 }
-if ($cliExit -ne 0) {
-    Write-Bad "hkdfguard-v1-initialize.exe exited $cliExit"
-} else {
-    Write-Ok "CLI wrapped the DEK to $keyFile"
+if ($provisionExit -eq 0) {
+    if ($cliExit -ne 0) {
+        Write-Bad "hkdfguard-v1-initialize.exe wrap exited $cliExit"
+    } else {
+        Write-Ok "CLI wrapped the DEK to $keyFile"
+    }
 }
 
 if ($cliExit -eq 0) {
