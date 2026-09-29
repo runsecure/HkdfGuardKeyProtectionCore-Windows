@@ -156,7 +156,7 @@ try {
         $providerName = $null
         if ($r.ExitCode -eq 0) {
             $bytes = [System.IO.File]::ReadAllBytes($happyKeyFile)
-            Check ($bytes.Length -eq 132) "CLI-produced wrapped file is 132 bytes"
+            Check ($bytes.Length -eq 164) "CLI-produced wrapped file is 164 bytes"
 
             $dekBytes2 = New-Object byte[] 32
             [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes2)
@@ -181,7 +181,9 @@ try {
         # tests/CMakeLists.txt), which isn't guaranteed to still resolve
         # ordinary system tools.
         if ($providerName) {
-            $keyName = "HkdfGuardWin_${serviceName}_v1"
+            # Matches kek_store.cpp's KeyName(): every piece is lowercase, and
+            # $serviceName is already lowercase.
+            $keyName = "hkdfguardwin_${serviceName}_v1"
             $certutilPath = Join-Path $env:SystemRoot "System32\certutil.exe"
             & $certutilPath -csp $providerName -delkey $keyName | Out-Null
         }

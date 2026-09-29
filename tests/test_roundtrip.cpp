@@ -8,6 +8,9 @@
 #include "hkdfguard.h"  // the public ABI under test
 #include "kek_store.h"  // CreateKek/KekExists/OpenKekForWrap/DeleteKek - internal helpers, used directly below
 #include "policy.h"     // SetTestPolicyOverride - internal test-only seam, used directly below
+#include "ecdh_hkdf.h"  // ValidateEphemeralPublicKey - the unwrap-side point-validation gate, tested directly below
+#include "errors.h"     // HkdfGuardError - caught by EphemeralGateResult below to read the gate's error code
+#include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
 
 #include <cstdio>
 #include <cstring>
@@ -80,14 +83,14 @@ constexpr char kServiceOther[] = "hkdfguardwin.test.service.other";
 constexpr wchar_t kServiceOtherWide[] = L"hkdfguardwin.test.service.other";
 
 // Dedicated service names for the hkdfguard_kek_exists/hkdfguard_create_kek
-// lifecycle checks (0) and the groups_csv length/whitespace checks (0c)
-// below - kept separate from kService so those checks can rely on the
-// service having no KEK yet at the point they run.
+// lifecycle checks (0) and the key-use group policy checks (0d) below -
+// kept separate from kService so those checks can rely on the service
+// having no KEK yet at the point they run.
 constexpr char kServiceLifecycle[] = "hkdfguardwin.test.lifecycle";
 constexpr wchar_t kServiceLifecycleWide[] = L"hkdfguardwin.test.lifecycle";
 constexpr char kServiceNoKek[] = "hkdfguardwin.test.nokek";
-constexpr char kServiceGroupsCsv[] = "hkdfguardwin.test.groupscsv";
-constexpr wchar_t kServiceGroupsCsvWide[] = L"hkdfguardwin.test.groupscsv";
+constexpr char kServiceUseGroups[] = "hkdfguardwin.test.usegroups";
+constexpr wchar_t kServiceUseGroupsWide[] = L"hkdfguardwin.test.usegroups";
 
 // Deletes the KEK created for `service` during this test run, so repeated
 // runs don't accumulate persisted keys in the user's key storage. Uses the
@@ -138,7 +141,7 @@ void CheckPolicyCreatesKek(
     hkdfguard::SetTestPolicyOverride(policy);
 
     try {
-        hkdfguard::CreateKek(serviceWide, {});
+        hkdfguard::CreateKek(serviceWide);
         Check(true, (label + ": create_kek succeeds").c_str());
 
         Check(hkdfguard::KekExists(serviceWide), (label + ": kek_exists reports true afterward").c_str());
@@ -172,6 +175,77 @@ void CheckPolicyCreatesKek(
     hkdfguard::SetTestPolicyOverride(std::nullopt);
 }
 
+// Generates a genuine, freshly-random P-256 public point (raw X||Y, 64
+// bytes) via BCrypt - the same way ecdh_hkdf.cpp's wrap side makes its
+// ephemeral key - as known-good input for the ValidateEphemeralPublicKey
+// checks. Returns an empty vector if any BCrypt step fails, which the caller
+// reports as its own failed check rather than silently skipping the section.
+std::vector<uint8_t> MakeValidP256Point() {
+    hkdfguard::ScopedBCryptAlg alg;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(alg.put(), BCRYPT_ECDH_P256_ALGORITHM, nullptr, 0))) return {};
+    hkdfguard::ScopedBCryptKey key;
+    if (!BCRYPT_SUCCESS(BCryptGenerateKeyPair(alg.get(), key.put(), 256, 0))) return {};
+    if (!BCRYPT_SUCCESS(BCryptFinalizeKeyPair(key.get(), 0))) return {};
+    ULONG cb = 0;
+    if (!BCRYPT_SUCCESS(BCryptExportKey(key.get(), nullptr, BCRYPT_ECCPUBLIC_BLOB, nullptr, 0, &cb, 0))) return {};
+    std::vector<uint8_t> blob(cb);
+    if (!BCRYPT_SUCCESS(BCryptExportKey(key.get(), nullptr, BCRYPT_ECCPUBLIC_BLOB, blob.data(), cb, &cb, 0))) return {};
+    if (blob.size() < sizeof(BCRYPT_ECCKEY_BLOB) + hkdfguard::kEphemeralPubLen) return {};
+    return std::vector<uint8_t>(
+        blob.begin() + sizeof(BCRYPT_ECCKEY_BLOB),
+        blob.begin() + sizeof(BCRYPT_ECCKEY_BLOB) + hkdfguard::kEphemeralPubLen);
+}
+
+// Runs the gate on `point` and returns the HKDFGUARD_* code it produced:
+// HKDFGUARD_OK if it accepted the point, the thrown error's code if it
+// rejected it, or a sentinel if something other than HkdfGuardError escaped.
+int32_t EphemeralGateResult(const std::vector<uint8_t>& point) {
+    try {
+        hkdfguard::ValidateEphemeralPublicKey(point.data());
+        return HKDFGUARD_OK;
+    } catch (const hkdfguard::HkdfGuardError& e) {
+        return e.code();
+    } catch (...) {
+        return -9999;
+    }
+}
+
+// Runs the internal CreateKek - which reads the key-use group list through
+// the same test-only override seam CheckPolicyCreatesKek uses for the
+// storage policy - and returns the HKDFGUARD_* code it produced. Has to be
+// the internal call: the DLL behind hkdfguard_create_kek reads the real
+// registry and can't see this process's override.
+int32_t InternalCreateKekResult(const wchar_t* serviceWide) {
+    try {
+        hkdfguard::CreateKek(serviceWide);
+        return HKDFGUARD_OK;
+    } catch (const hkdfguard::HkdfGuardError& e) {
+        return e.code();
+    } catch (...) {
+        return -9999;
+    }
+}
+
+// Picks a real, narrow local group for the key-use-policy accept case: the
+// first candidate that resolves on this machine. The test can't hardcode
+// one - edition-dependent groups such as "Cryptographic Operators" or
+// "Backup Operators" don't exist on Windows Home, for instance.
+// BUILTIN\Administrators is the last resort because it exists everywhere;
+// it's already granted full control by ApplyKeyAcl regardless, but the
+// policy path still has to resolve, vet and grant it like any other entry.
+std::wstring PickNarrowGroup() {
+    for (const wchar_t* candidate : {L"Performance Log Users", L"Administrators"}) {
+        DWORD sidSize = 0;
+        DWORD domainSize = 0;
+        SID_NAME_USE type;
+        LookupAccountNameW(nullptr, candidate, nullptr, &sidSize, nullptr, &domainSize, &type);
+        if (sidSize != 0) {
+            return candidate;
+        }
+    }
+    return L"Administrators";
+}
+
 } // namespace
 
 int main() {
@@ -187,7 +261,7 @@ int main() {
     Check(rc == HKDFGUARD_OK, "kek_exists succeeds for a service with no KEK yet");
     Check(lifecycle_exists == 0, "kek_exists reports false before the KEK is created");
 
-    rc = hkdfguard_create_kek(kServiceLifecycle, nullptr);
+    rc = hkdfguard_create_kek(kServiceLifecycle);
     Check(rc == HKDFGUARD_OK, "create_kek provisions a new KEK");
 
     lifecycle_exists = -1;
@@ -197,7 +271,7 @@ int main() {
 
     // create_kek is safe to call again for an already-provisioned service:
     // it verifies rather than failing or re-creating.
-    rc = hkdfguard_create_kek(kServiceLifecycle, nullptr);
+    rc = hkdfguard_create_kek(kServiceLifecycle);
     Check(rc == HKDFGUARD_OK, "create_kek is idempotent for an already-provisioned service");
 
     // wrap now succeeds, since create_kek has provisioned the KEK it needs.
@@ -214,7 +288,7 @@ int main() {
     int32_t no_kek_scratch_len = static_cast<int32_t>(no_kek_scratch.size());
     rc = hkdfguard_wrap_dek(
         kServiceNoKek, dek.data(), static_cast<int32_t>(dek.size()), no_kek_scratch.data(), &no_kek_scratch_len);
-    Check(rc == HKDFGUARD_ERR_PROVIDER, "wrap fails when no KEK has been provisioned for the service");
+    Check(rc == HKDFGUARD_ERR_KEK_NOT_FOUND, "wrap fails with KEK_NOT_FOUND when no KEK has been provisioned for the service");
 
     // ---- 0c. kek_exists / create_kek argument validation. ----
     rc = hkdfguard_kek_exists(nullptr, &lifecycle_exists);
@@ -226,47 +300,152 @@ int main() {
     rc = hkdfguard_kek_exists("", &lifecycle_exists);
     Check(rc == HKDFGUARD_ERR_SERVICE_NAME_INVALID, "kek_exists rejects empty service");
 
-    rc = hkdfguard_create_kek(nullptr, nullptr);
+    rc = hkdfguard_create_kek(nullptr);
     Check(rc == HKDFGUARD_ERR_INVALID_ARG, "create_kek rejects null service");
 
-    // A groups_csv longer than kMaxGroupsCsvLen (8192 bytes, see
-    // hkdfguard.cpp) is rejected before ever touching the KEK store - proven
-    // here against kServiceLifecycle, which already has a KEK, since
-    // ParseAndConvertGroups runs before CreateKek either way.
-    const std::string too_long_groups_csv(8193, 'A');
-    rc = hkdfguard_create_kek(kServiceLifecycle, too_long_groups_csv.c_str());
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "create_kek rejects a groups_csv longer than 8192 bytes");
-
-    // A groups_csv of exactly 8192 bytes - one real, universally-present
-    // group name ("Everyone") surrounded by whitespace, padded out to the
-    // boundary with trailing commas (which parse as empty tokens and are
-    // silently skipped) - succeeds. This also proves leading/trailing
-    // whitespace around a group name is trimmed before resolution: without
-    // trimming, " Everyone " does not name any account, and create_kek
-    // would fail with HKDFGUARD_ERR_PROVIDER instead. Uses a fresh service
-    // (kServiceGroupsCsv), since create_kek only ever applies ACLs at
-    // initial creation - reusing an already-provisioned service like
-    // kServiceLifecycle wouldn't actually exercise group resolution here.
-    std::string boundary_groups_csv = " Everyone ";
-    boundary_groups_csv.append(8192 - boundary_groups_csv.size(), ',');
-    rc = hkdfguard_create_kek(kServiceGroupsCsv, boundary_groups_csv.c_str());
+    // ---- 0d. Key-use group policy (HKLM\Software\Policies\HkdfGuard\ ----
+    //          KeyUseGroups). Which principals may unwrap is machine policy,
+    //          vetted before any key is created. Forced via the test-only
+    //          override (see policy.h) so this doesn't depend on this
+    //          machine's real registry. Every rejection below fires before
+    //          the key store is touched, so these are meaningful even
+    //          without elevation.
+    hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"Everyone"});
     Check(
-        rc == HKDFGUARD_OK,
-        "create_kek accepts a groups_csv of exactly 8192 bytes and trims whitespace around group names");
-    bool groups_csv_service_created = (rc == HKDFGUARD_OK);
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        "create_kek rejects Everyone as a key-use group");
 
-    std::vector<uint8_t> groups_csv_wrapped(HKDFGUARD_WRAPPED_LEN);
-    int32_t groups_csv_wrapped_len = static_cast<int32_t>(groups_csv_wrapped.size());
-    if (groups_csv_service_created) {
+    // The same principal given as a SID string must be caught the same way -
+    // the over-broad check is by SID, not by spelling.
+    hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"S-1-1-0"});
+    Check(
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        "create_kek rejects Everyone given as a SID string");
+
+    hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"Authenticated Users"});
+    Check(
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        "create_kek rejects Authenticated Users as a key-use group");
+
+    hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"Users"});
+    Check(
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        "create_kek rejects BUILTIN\\Users as a key-use group");
+
+    // A user account - even a perfectly real one - is not a group.
+    wchar_t current_user[256] = {};
+    DWORD current_user_len = static_cast<DWORD>(sizeof(current_user) / sizeof(current_user[0]));
+    if (GetUserNameW(current_user, &current_user_len)) {
+        hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{current_user});
+        Check(
+            InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+            "create_kek rejects a user account as a key-use group");
+    }
+
+    hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"hkdfguard.no.such.group.x"});
+    Check(
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        "create_kek rejects an unresolvable key-use group");
+
+    // One bad entry anywhere in the list fails the whole call, even when
+    // it's preceded by a good one.
+    const std::wstring narrow_group = PickNarrowGroup();
+    std::printf("    (narrow key-use group used by this run: %ls)\n", narrow_group.c_str());
+    hkdfguard::SetTestKeyUseGroupsOverride(
+        std::vector<std::wstring>{narrow_group, L"Everyone"});
+    Check(
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        "create_kek rejects a list containing one over-broad entry among valid ones");
+
+    // None of the rejected attempts may have left a key behind.
+    bool use_groups_exists_after_rejects = true;
+    try {
+        use_groups_exists_after_rejects = hkdfguard::KekExists(kServiceUseGroupsWide);
+    } catch (...) {
+    }
+    Check(!use_groups_exists_after_rejects, "rejected key-use group policies create no KEK");
+
+    // A legitimate, narrow, universally-present group - with stray
+    // whitespace, which policy entries are trimmed of - is accepted and
+    // granted, and the resulting KEK is usable through the public ABI.
+    // Host-local only: which account domains the vetting treats as local.
+    // This is where "domain groups do not apply" is decided, on the
+    // ReferencedDomainName Windows reports for the resolved principal.
+    wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD computer_name_len = MAX_COMPUTERNAME_LENGTH + 1;
+    Check(GetComputerNameW(computer_name, &computer_name_len) != FALSE, "test harness can read the local computer name");
+    Check(hkdfguard::IsHostLocalAccountDomain(computer_name), "this machine's own computer name counts as host-local");
+    Check(hkdfguard::IsHostLocalAccountDomain(L"BUILTIN"), "BUILTIN counts as host-local");
+    Check(hkdfguard::IsHostLocalAccountDomain(L"nt authority"), "NT AUTHORITY counts as host-local (case-insensitive)");
+    Check(hkdfguard::IsHostLocalAccountDomain(L"NT SERVICE"), "NT SERVICE counts as host-local");
+    Check(!hkdfguard::IsHostLocalAccountDomain(L"CORP"), "a domain's name does not count as host-local");
+    Check(!hkdfguard::IsHostLocalAccountDomain(L""), "the empty domain well-known SIDs report does not count as host-local");
+
+    // A domain-qualified spelling of a local group must validate. Default
+    // Windows keeps every built-in local group in the BUILTIN domain (the
+    // machine's own SAM domain holds accounts, not groups), and Windows
+    // does not resolve "COMPUTERNAME\<builtin alias>" at all - so BUILTIN
+    // is the qualifier that actually exists for `narrow_group`.
+    hkdfguard::SetTestKeyUseGroupsOverride(
+        std::vector<std::wstring>{L"BUILTIN\\" + narrow_group});
+    bool qualified_local_validates = false;
+    try {
+        hkdfguard::ValidateKeyUseGroups(hkdfguard::LoadKeyUseGroupsPolicy());
+        qualified_local_validates = true;
+    } catch (...) {
+    }
+    Check(qualified_local_validates, "a BUILTIN-qualified local group validates");
+
+    // ...and a foreign-domain-qualified one must not. (On a machine that
+    // isn't domain-joined this fails at resolution; on a joined one a real
+    // domain group would resolve and then fail the host-local check - the
+    // IsHostLocalAccountDomain checks above cover that branch directly.)
+    hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"NOSUCHDOMAIN\\Users"});
+    Check(
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        "create_kek rejects a group qualified with a foreign domain");
+
+    hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"  " + narrow_group + L"  "});
+
+    // Prove the entry is accepted by the vetting itself - trimmed, resolved,
+    // a group, not over-broad - independently of whether this process can
+    // actually create a key (which needs elevation). This is the check that
+    // separates "the policy is fine" from "the environment can't provision".
+    bool trimmed_entry_validates = false;
+    try {
+        hkdfguard::ValidateKeyUseGroups(hkdfguard::LoadKeyUseGroupsPolicy());
+        trimmed_entry_validates = true;
+    } catch (...) {
+    }
+    Check(trimmed_entry_validates, "key-use policy entry with surrounding whitespace is trimmed and validates as a real group");
+
+    rc = InternalCreateKekResult(kServiceUseGroupsWide);
+    Check(rc == HKDFGUARD_OK, "create_kek accepts a real group from the key-use policy (whitespace trimmed)");
+    if (rc != HKDFGUARD_OK) {
+        // HKDFGUARD_ERR_ACCESS_DENIED (-13) here with the validation check
+        // above passing means the environment couldn't provision (this
+        // process isn't elevated - NCryptFinalizeKey is the call that
+        // actually enforces that for a new machine-scoped key, see
+        // kek_store.cpp's ThrowForNCryptFailure); HKDFGUARD_ERR_GROUP_INVALID
+        // (-10) would mean the vetting inside ApplyKeyAcl disagreed with
+        // ValidateKeyUseGroups - a real bug.
+        std::printf("    (create_kek returned %d)\n", rc);
+    }
+    bool use_groups_service_created = (rc == HKDFGUARD_OK);
+    hkdfguard::SetTestKeyUseGroupsOverride(std::nullopt);
+
+    std::vector<uint8_t> use_groups_wrapped(HKDFGUARD_WRAPPED_LEN);
+    int32_t use_groups_wrapped_len = static_cast<int32_t>(use_groups_wrapped.size());
+    if (use_groups_service_created) {
         rc = hkdfguard_wrap_dek(
-            kServiceGroupsCsv, dek.data(), static_cast<int32_t>(dek.size()), groups_csv_wrapped.data(),
-            &groups_csv_wrapped_len);
-        Check(rc == HKDFGUARD_OK, "wrap succeeds against the groups_csv test service's newly-created KEK");
+            kServiceUseGroups, dek.data(), static_cast<int32_t>(dek.size()), use_groups_wrapped.data(),
+            &use_groups_wrapped_len);
+        Check(rc == HKDFGUARD_OK, "wrap succeeds against the key-use-policy test service's newly-created KEK");
     }
 
     // ---- 1. Provision kService's KEK, then a basic wrap -> unwrap ----
     //         roundtrip.
-    rc = hkdfguard_create_kek(kService, nullptr);
+    rc = hkdfguard_create_kek(kService);
     Check(rc == HKDFGUARD_OK, "create_kek provisions kService's KEK");
 
     std::vector<uint8_t> wrapped(HKDFGUARD_WRAPPED_LEN);
@@ -316,7 +495,7 @@ int main() {
     Check(rc == HKDFGUARD_OK, "kek_exists succeeds for a differently-cased alias of an existing service");
     Check(mixed_case_exists == 1, "kek_exists reports true for a differently-cased alias of an existing service");
 
-    rc = hkdfguard_create_kek(kServiceMixedCase, nullptr);
+    rc = hkdfguard_create_kek(kServiceMixedCase);
     Check(rc == HKDFGUARD_OK, "create_kek is idempotent for a differently-cased alias of an existing service");
 
     // Wrap using the mixed-case alias; it must reuse kService's existing KEK
@@ -488,13 +667,38 @@ int main() {
 
     // ---- 11. Corrupted tag -> authentication failure, output zeroed. ----
     std::vector<uint8_t> corrupted_tag = wrapped;
-    corrupted_tag[wrapped_len - 1] ^= 0xFF; // inside the tag region (the payload's very last byte)
+    corrupted_tag[hkdfguard::kTagOffset + hkdfguard::kTagLen - 1] ^= 0xFF; // last byte of the tag region
     std::vector<uint8_t> out_for_tag(HKDFGUARD_DEK_LEN, 0xAA);
     int32_t tag_out_len = static_cast<int32_t>(out_for_tag.size());
     rc = hkdfguard_unwrap_dek(kService, corrupted_tag.data(), static_cast<int32_t>(corrupted_tag.size()),
                               out_for_tag.data(), &tag_out_len);
     Check(rc == HKDFGUARD_ERR_AUTH_FAILED, "unwrap rejects corrupted tag");
     Check(AllZero(out_for_tag.data(), out_for_tag.size()), "output buffer zeroed after tag failure");
+
+    // ---- 11b. Corrupted KEK fingerprint -> KEK_MISMATCH (not AUTH_FAILED), ----
+    //           output zeroed. The fingerprint is checked against the opened
+    //           KEK before any ECDH/decryption, so a payload that doesn't
+    //           belong to this KEK is distinguishable from a tampered one.
+    std::vector<uint8_t> corrupted_fingerprint = wrapped;
+    corrupted_fingerprint[wrapped_len - 1] ^= 0xFF; // the payload's very last byte is now fingerprint, not tag
+    std::vector<uint8_t> out_for_fingerprint(HKDFGUARD_DEK_LEN, 0xAA);
+    int32_t fingerprint_out_len = static_cast<int32_t>(out_for_fingerprint.size());
+    rc = hkdfguard_unwrap_dek(
+        kService, corrupted_fingerprint.data(), static_cast<int32_t>(corrupted_fingerprint.size()),
+        out_for_fingerprint.data(), &fingerprint_out_len);
+    Check(rc == HKDFGUARD_ERR_KEK_MISMATCH, "unwrap rejects a payload whose KEK fingerprint doesn't match as KEK_MISMATCH");
+    Check(AllZero(out_for_fingerprint.data(), out_for_fingerprint.size()), "output buffer zeroed after fingerprint mismatch");
+
+    // ---- 11c. Non-zero reserved bytes -> malformed, output zeroed. ----
+    std::vector<uint8_t> nonzero_reserved = wrapped;
+    nonzero_reserved[hkdfguard::kReservedOffset + 1] = 0x01;
+    std::vector<uint8_t> out_for_reserved(HKDFGUARD_DEK_LEN, 0xAA);
+    int32_t reserved_out_len = static_cast<int32_t>(out_for_reserved.size());
+    rc = hkdfguard_unwrap_dek(
+        kService, nonzero_reserved.data(), static_cast<int32_t>(nonzero_reserved.size()),
+        out_for_reserved.data(), &reserved_out_len);
+    Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects non-zero reserved bytes");
+    Check(AllZero(out_for_reserved.data(), out_for_reserved.size()), "output buffer zeroed after reserved-bytes failure");
 
     // ---- 12. Invalid service (null / empty) is rejected on wrap. ----
     // Null service fails the null-pointer check (HKDFGUARD_ERR_INVALID_ARG);
@@ -516,7 +720,7 @@ int main() {
     // ---- 13. A different service gets its own independent KEK, and a ----
     //          payload wrapped under one service cannot be unwrapped under
     //          another.
-    rc = hkdfguard_create_kek(kServiceOther, nullptr);
+    rc = hkdfguard_create_kek(kServiceOther);
     Check(rc == HKDFGUARD_OK, "create_kek provisions kServiceOther's KEK");
 
     bool other_service_wrapped = false;
@@ -530,10 +734,12 @@ int main() {
     int32_t out_wrong_service_len = static_cast<int32_t>(out_wrong_service.size());
     rc = hkdfguard_unwrap_dek(kServiceOther, wrapped.data(), wrapped_len, out_wrong_service.data(), &out_wrong_service_len);
     // kServiceOther's own KEK now exists (created just above), so this
-    // legitimately opens *that* KEK and fails AES-GCM authentication rather
-    // than failing to find a key at all - either is a correct "wrong
-    // service can't unwrap" outcome.
-    Check(rc == HKDFGUARD_ERR_PROVIDER || rc == HKDFGUARD_ERR_AUTH_FAILED, "unwrap with the wrong service fails");
+    // legitimately opens *that* KEK - whose fingerprint doesn't match the
+    // payload's - and is rejected as KEK_MISMATCH before any ECDH, rather
+    // than failing to find a key at all (KEK_NOT_FOUND, the only other
+    // correct outcome, if kServiceOther's KEK couldn't be created - e.g.
+    // this process isn't elevated).
+    Check(rc == HKDFGUARD_ERR_KEK_MISMATCH || rc == HKDFGUARD_ERR_KEK_NOT_FOUND, "unwrap with the wrong service fails with KEK_MISMATCH");
     Check(AllZero(out_wrong_service.data(), out_wrong_service.size()), "output buffer zeroed after wrong-service failure");
 
     // ---- 14. Null-pointer argument validation, wrap side. ----
@@ -566,7 +772,7 @@ int main() {
     const std::string service128(128, 'a');
     const std::string service129(129, 'a');
 
-    rc = hkdfguard_create_kek(service128.c_str(), nullptr);
+    rc = hkdfguard_create_kek(service128.c_str());
     Check(rc == HKDFGUARD_OK, "create_kek accepts a service name exactly at the 128-byte maximum");
     bool service128_created = (rc == HKDFGUARD_OK);
 
@@ -672,6 +878,22 @@ int main() {
     Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects an unrecognized provider type byte");
     Check(AllZero(out_for_provider.data(), out_for_provider.size()), "output buffer zeroed after unrecognized-provider-type failure");
 
+    // ---- 23b. A KeyId other than kCurrentKeyId is rejected as malformed. ----
+    //           HkdfGuard has no key-rotation mechanism (a new KEK means a
+    //           versioned service name, not a new KeyId under the same
+    //           service - see wire_format.h's kCurrentKeyId), so any other
+    //           KeyId value is rejected outright rather than being used to
+    //           look up a persisted key that, by design, could never exist.
+    std::vector<uint8_t> corrupted_key_id = wrapped;
+    corrupted_key_id[hkdfguard::kKeyIdOffset] ^= 0xFF; // KeyId is little-endian at this offset (see wire_format.h)
+    std::vector<uint8_t> out_for_key_id(HKDFGUARD_DEK_LEN, 0xAA);
+    int32_t key_id_out_len = static_cast<int32_t>(out_for_key_id.size());
+    rc = hkdfguard_unwrap_dek(
+        kService, corrupted_key_id.data(), static_cast<int32_t>(corrupted_key_id.size()),
+        out_for_key_id.data(), &key_id_out_len);
+    Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects a KeyId other than kCurrentKeyId");
+    Check(AllZero(out_for_key_id.data(), out_for_key_id.size()), "output buffer zeroed after unrecognized-KeyId failure");
+
     // ---- 24. Null-pointer argument validation, generate_and_wrap_dek. ----
     int32_t gen_null_out_len = static_cast<int32_t>(gen_scratch.size());
     rc = hkdfguard_generate_and_wrap_dek(kService, nullptr, &gen_null_out_len);
@@ -679,6 +901,51 @@ int main() {
 
     rc = hkdfguard_generate_and_wrap_dek(kService, gen_scratch.data(), nullptr);
     Check(rc == HKDFGUARD_ERR_INVALID_ARG, "generate_and_wrap rejects null out_len");
+
+    // ---- 24b. Unwrap-side ephemeral public key validation gate. ----
+    //          The ephemeral point in a payload is attacker-controlled and
+    //          is combined with the long-term KEK private key, so it must be
+    //          proven to lie on P-256 before any KSP (especially the TPM's)
+    //          ever sees it. First the gate itself, directly - no KEK or
+    //          elevation needed - then the same thing through the public
+    //          ABI against a real payload.
+    std::vector<uint8_t> valid_point = MakeValidP256Point();
+    Check(valid_point.size() == hkdfguard::kEphemeralPubLen, "test harness can generate a valid P-256 point");
+    if (valid_point.size() == hkdfguard::kEphemeralPubLen) {
+        Check(EphemeralGateResult(valid_point) == HKDFGUARD_OK, "ephemeral gate accepts a genuine P-256 point");
+
+        std::vector<uint8_t> all_ff(hkdfguard::kEphemeralPubLen, 0xFF);
+        Check(EphemeralGateResult(all_ff) == HKDFGUARD_ERR_MALFORMED, "ephemeral gate rejects all-0xFF coordinates");
+
+        std::vector<uint8_t> all_zero(hkdfguard::kEphemeralPubLen, 0x00);
+        Check(EphemeralGateResult(all_zero) == HKDFGUARD_ERR_MALFORMED, "ephemeral gate rejects all-zero coordinates");
+
+        // A single flipped bit in X, and separately in Y, leaves a point
+        // that is off the curve with overwhelming probability (~1 - 2^-256).
+        std::vector<uint8_t> flipped_x = valid_point;
+        flipped_x[0] ^= 0x01;
+        Check(EphemeralGateResult(flipped_x) == HKDFGUARD_ERR_MALFORMED, "ephemeral gate rejects a single-bit mutation in X");
+
+        std::vector<uint8_t> flipped_y = valid_point;
+        flipped_y[hkdfguard::kEphemeralPubLen - 1] ^= 0x01;
+        Check(EphemeralGateResult(flipped_y) == HKDFGUARD_ERR_MALFORMED, "ephemeral gate rejects a single-bit mutation in Y");
+    }
+
+    // Through the public ABI: a payload whose EphemeralPublicKey field (bytes
+    // 8..71, see wire_format.h) is overwritten with 0xFF must come back as
+    // HKDFGUARD_ERR_MALFORMED - not AUTH_FAILED or CRYPTO - with the output
+    // zeroed, proving the gate runs before any ECDH is attempted.
+    std::vector<uint8_t> bad_point_payload = wrapped;
+    for (size_t i = hkdfguard::kEphemeralPubOffset; i < hkdfguard::kEphemeralPubOffset + hkdfguard::kEphemeralPubLen; ++i) {
+        bad_point_payload[i] = 0xFF;
+    }
+    std::vector<uint8_t> out_for_bad_point(HKDFGUARD_DEK_LEN, 0xAA);
+    int32_t bad_point_out_len = static_cast<int32_t>(out_for_bad_point.size());
+    rc = hkdfguard_unwrap_dek(
+        kService, bad_point_payload.data(), static_cast<int32_t>(bad_point_payload.size()),
+        out_for_bad_point.data(), &bad_point_out_len);
+    Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects a payload whose ephemeral public key is not on P-256");
+    Check(AllZero(out_for_bad_point.data(), out_for_bad_point.size()), "output buffer zeroed after invalid-ephemeral-point failure");
 
     // ---- 25. KeyStoragePolicy is honored for all three values, forced via ----
     //          a test-only override so this doesn't depend on this
@@ -711,13 +978,56 @@ int main() {
         "RequireTpm policy",
         /*tpmMayBeUnavailable=*/true); // no fallback - may legitimately fail without real TPM hardware
 
+    // ---- 25b. An invalid KeyStoragePolicy value fails closed with ----
+    //           HKDFGUARD_ERR_INVALID_POLICY, rather than being silently
+    //           treated as PreferTpm. KeyStoragePolicy::Invalid is exactly
+    //           what policy.cpp's ParsePolicyValue returns for a REG_DWORD
+    //           value that isn't 0/1/2, or what LoadEffectivePolicy returns
+    //           for a value of the wrong registry type - see policy.h's
+    //           comment on why that's a deliberate fail-closed choice
+    //           rather than a default substitution. Forced via the same
+    //           test-only override as section 25 above, so this needs
+    //           neither a real bad registry value nor elevation:
+    //           KekExists/CreateKek/OpenKekForWrap all read policy and
+    //           react to it immediately, before ever calling into NCrypt.
+    //           (OpenKekForUnwrap has the identical `if (policy ==
+    //           KeyStoragePolicy::Invalid) throw ...` guard - see
+    //           kek_store.cpp - but only reaches it after successfully
+    //           opening a real key, so exercising it here would need a
+    //           provisioned KEK; not duplicated as a separate check.)
+    hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::Invalid);
+
+    bool kek_exists_rejects_invalid_policy = false;
+    try {
+        hkdfguard::KekExists(kServiceLifecycleWide);
+    } catch (const hkdfguard::HkdfGuardError &e) {
+        kek_exists_rejects_invalid_policy = (e.code() == HKDFGUARD_ERR_INVALID_POLICY);
+    } catch (...) {
+    }
+    Check(kek_exists_rejects_invalid_policy, "KekExists fails closed with INVALID_POLICY for an unrecognized policy value");
+
+    Check(
+        InternalCreateKekResult(kServiceLifecycleWide) == HKDFGUARD_ERR_INVALID_POLICY,
+        "create_kek fails closed with INVALID_POLICY for an unrecognized policy value");
+
+    bool wrap_rejects_invalid_policy = false;
+    try {
+        hkdfguard::OpenKekForWrap(kServiceLifecycleWide);
+    } catch (const hkdfguard::HkdfGuardError &e) {
+        wrap_rejects_invalid_policy = (e.code() == HKDFGUARD_ERR_INVALID_POLICY);
+    } catch (...) {
+    }
+    Check(wrap_rejects_invalid_policy, "wrap fails closed with INVALID_POLICY for an unrecognized policy value");
+
+    hkdfguard::SetTestPolicyOverride(std::nullopt);
+
     // ---- Cleanup. ----
     // Remove the KEKs this test run created so they don't accumulate in the
     // user's key storage across repeated runs. (CheckPolicyCreatesKek above
     // already cleans up after itself.)
     CleanupKek(kServiceLifecycleWide, lifecycle_wrapped[1], "lifecycle test service");
-    if (groups_csv_service_created) {
-        CleanupKek(kServiceGroupsCsvWide, groups_csv_wrapped[1], "groups_csv boundary/trim test service");
+    if (use_groups_service_created) {
+        CleanupKek(kServiceUseGroupsWide, use_groups_wrapped[1], "key-use-policy test service");
     }
     CleanupKek(kServiceWide, provider_type, "primary test service");
     if (other_service_wrapped) {

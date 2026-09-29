@@ -51,6 +51,63 @@ namespace hkdfguard {
             }
         }
 
+        // Throws the most specific HkdfGuardError an NCrypt failure
+        // warrants, rather than the generic HKDFGUARD_ERR_PROVIDER every
+        // such failure used to collapse into. Used at every NCryptOpenKey
+        // call site (open-for-wrap, open-for-unwrap, the exists check, and
+        // create's "does it already exist" probe) and at
+        // NCryptFinalizeKey's - empirically confirmed to be the call that
+        // actually fails, with this exact status, when a process without
+        // Administrator rights tries to create a *machine-scoped*
+        // (NCRYPT_MACHINE_KEY_FLAG) key: NCryptCreatePersistedKey and the
+        // property-setting calls before it all succeed regardless of
+        // elevation; only finalizing the persisted key enforces it.
+        //
+        //   - NTE_BAD_KEYSET  -> HKDFGUARD_ERR_KEK_NOT_FOUND: no key by
+        //     this name exists yet (the service has never been
+        //     provisioned, or a payload names a provider/key id this
+        //     service never used). Only meaningful at the NCryptOpenKey
+        //     call sites; NCryptFinalizeKey never returns it.
+        //   - NTE_PERM (Microsoft's own documented meaning is literally
+        //     "Access is denied"), or the Win32 ERROR_ACCESS_DENIED some
+        //     providers surface instead -> HKDFGUARD_ERR_ACCESS_DENIED: the
+        //     key exists (or, at NCryptFinalizeKey, is about to) but this
+        //     caller's token isn't authorized for the operation - which
+        //     includes "not elevated enough to finalize a machine-scoped
+        //     key," the single most common real-world cause of this whole
+        //     function throwing.
+        //   - anything else -> HKDFGUARD_ERR_PROVIDER (`genericMessage`): a
+        //     genuine provider malfunction, unrelated to who's asking.
+        //
+        // Distinguishing these lets both a program (which can retry/report
+        // differently) and an operator reading logs tell "nothing has been
+        // provisioned yet" apart from "this account/process isn't
+        // authorized" apart from "the provider itself is broken" -
+        // previously all three were the same opaque code.
+        [[noreturn]] void ThrowForNCryptFailure(
+            SECURITY_STATUS status,
+            const char* genericMessage)
+        {
+            if (status == NTE_BAD_KEYSET)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_KEK_NOT_FOUND,
+                    "no KEK is provisioned for this service/provider/key id");
+            }
+
+            if (status == NTE_PERM ||
+                status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED))
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_ACCESS_DENIED,
+                    "access to the KEK was denied");
+            }
+
+            throw HkdfGuardError(
+                HKDFGUARD_ERR_PROVIDER,
+                genericMessage);
+        }
+
         // Verifies the key is an ECDH key. Checks NCRYPT_ALGORITHM_GROUP_PROPERTY
         // ("Algorithm Group", e.g. "ECDH") rather than NCRYPT_ALGORITHM_PROPERTY
         // ("Algorithm Name", the curve-qualified AlgId originally passed to
@@ -326,13 +383,15 @@ namespace hkdfguard {
                     result.key.put(),
                     name.c_str(),
                     0,
-                    NCRYPT_MACHINE_KEY_FLAG);
+                    // NCRYPT_SILENT_FLAG: fail instead of showing UI (or
+                    // blocking indefinitely waiting for it) if this key ever
+                    // carried a UI-requiring protection policy - empirically
+                    // confirmed accepted (not NTE_BAD_FLAGS) by NCryptOpenKey.
+                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
 
             if (status != ERROR_SUCCESS)
             {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
-                    "NCryptOpenKey failed");
+                ThrowForNCryptFailure(status, "NCryptOpenKey failed");
             }
 
             VerifyKeyProperties(
@@ -380,7 +439,9 @@ namespace hkdfguard {
                     key.put(),
                     name.c_str(),
                     0,
-                    NCRYPT_MACHINE_KEY_FLAG);
+                    // See OpenKekOnProvider's identical NCryptOpenKey call
+                    // above for why NCRYPT_SILENT_FLAG is added here too.
+                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
 
             if (status == ERROR_SUCCESS)
             {
@@ -392,9 +453,11 @@ namespace hkdfguard {
                 return false;
             }
 
-            throw HkdfGuardError(
-                HKDFGUARD_ERR_PROVIDER,
-                "NCryptOpenKey failed");
+            // Notably: NTE_PERM here means this caller can't even confirm
+            // whether the key exists (reported as HKDFGUARD_ERR_ACCESS_DENIED,
+            // not as `false`) - a permissions problem must never be
+            // misreported as "no KEK provisioned."
+            ThrowForNCryptFailure(status, "NCryptOpenKey failed");
         }
 
         void CreateKekOnProvider(
@@ -440,7 +503,9 @@ namespace hkdfguard {
                     key.put(),
                     name.c_str(),
                     0,
-                    NCRYPT_MACHINE_KEY_FLAG);
+                    // See OpenKekOnProvider's identical NCryptOpenKey call
+                    // above for why NCRYPT_SILENT_FLAG is added here too.
+                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
 
             if (status == ERROR_SUCCESS)
             {
@@ -455,9 +520,12 @@ namespace hkdfguard {
 
             if (status != NTE_BAD_KEYSET)
             {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
-                    "NCryptOpenKey failed");
+                // NTE_BAD_KEYSET (handled above, by falling through to
+                // create the key below) is the only outcome of this open
+                // that ISN'T an error here; anything else - notably
+                // NTE_PERM, if this key already exists but this caller
+                // can't open it - is.
+                ThrowForNCryptFailure(status, "NCryptOpenKey failed");
             }
 
             //
@@ -471,7 +539,11 @@ namespace hkdfguard {
                     NCRYPT_ECDH_P256_ALGORITHM,
                     name.c_str(),
                     0,
-                    NCRYPT_MACHINE_KEY_FLAG);
+                    // NCRYPT_SILENT_FLAG - see OpenKekOnProvider's comment on
+                    // the identical addition there; empirically confirmed
+                    // accepted (not NTE_BAD_FLAGS) by NCryptCreatePersistedKey
+                    // too.
+                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
 
             if (status != ERROR_SUCCESS)
             {
@@ -541,13 +613,20 @@ namespace hkdfguard {
             status =
                 NCryptFinalizeKey(
                     key.get(),
-                    0);
+                    // NCRYPT_SILENT_FLAG - empirically confirmed accepted
+                    // (not NTE_BAD_FLAGS) by NCryptFinalizeKey; see
+                    // OpenKekOnProvider's comment on the same addition.
+                    NCRYPT_SILENT_FLAG);
 
             if (status != ERROR_SUCCESS)
             {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
-                    "NCryptFinalizeKey failed");
+                // Empirically confirmed (see ThrowForNCryptFailure's
+                // comment): this is the call that actually enforces
+                // elevation for a machine-scoped key, and it reports that
+                // as NTE_PERM - mapped below to HKDFGUARD_ERR_ACCESS_DENIED,
+                // not the generic HKDFGUARD_ERR_PROVIDER a caller could
+                // otherwise mistake for "the TPM/KSP itself is broken."
+                ThrowForNCryptFailure(status, "NCryptFinalizeKey failed");
             }
 
             // Verify against a *freshly-reopened* handle, not `key` (the one
@@ -569,13 +648,13 @@ namespace hkdfguard {
                     verifyKey.put(),
                     name.c_str(),
                     0,
-                    NCRYPT_MACHINE_KEY_FLAG);
+                    // See OpenKekOnProvider's identical NCryptOpenKey call
+                    // above for why NCRYPT_SILENT_FLAG is added here too.
+                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
 
             if (status != ERROR_SUCCESS)
             {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
-                    "NCryptOpenKey (post-finalize verification) failed");
+                ThrowForNCryptFailure(status, "NCryptOpenKey (post-finalize verification) failed");
             }
 
             VerifyKeyProperties(
@@ -631,9 +710,18 @@ namespace hkdfguard {
     }
 
     void CreateKek(
-        const std::wstring& service,
-        const std::vector<std::wstring>& aclGroups)
+        const std::wstring& service)
     {
+        // Machine policy decides who may use the key (see hkdfguard.h).
+        // Validated first, before any provider is opened: a policy entry
+        // that isn't a real, non-over-broad group must fail the call
+        // outright rather than leave a key behind that was created and then
+        // abandoned part-way through ACL application.
+        std::vector<std::wstring> aclGroups =
+            LoadKeyUseGroupsPolicy();
+
+        ValidateKeyUseGroups(aclGroups);
+
         KeyStoragePolicy policy =
             LoadEffectivePolicy();
 
@@ -676,6 +764,43 @@ namespace hkdfguard {
                 }
                 catch (const HkdfGuardError&)
                 {
+                    // The TPM attempt above can fail at any point along its
+                    // create/finalize/verify sequence - including *after*
+                    // NCryptFinalizeKey has already committed a real,
+                    // persisted TPM key, if the post-finalize reopen or
+                    // VerifyKeyProperties/VerifyKeyAcl steps are what threw
+                    // (see CreateKekOnProvider). Left in place, that key
+                    // would be an orphan this function never reports to the
+                    // caller - worse, a *later* OpenKekForWrap call under
+                    // this same PreferTpm policy tries the TPM first via its
+                    // own, lighter-weight open-and-verify-once path (no
+                    // reopen workaround), and could succeed against exactly
+                    // that never-fully-verified key. An operator who saw
+                    // this call return HKDFGUARD_OK for the software KEK
+                    // would have no way to know wrap might actually be
+                    // routing through a different, unaudited one instead.
+                    //
+                    // Best-effort cleanup before falling back: in the
+                    // overwhelmingly common case (no TPM, or the TPM attempt
+                    // failed before ever finalizing anything - the fail-fast
+                    // NTE_BAD_KEYSET/provider-unavailable paths never
+                    // persist a key), this is a single fast NCryptOpenKey
+                    // that finds nothing and fails, mapped to
+                    // HKDFGUARD_ERR_KEK_NOT_FOUND, which is swallowed here.
+                    // Only in the rare case a key really was left behind
+                    // does this actually delete something - and if the
+                    // delete attempt itself fails for some other reason,
+                    // that's still not fatal: proceeding to create the
+                    // software fallback below is correct either way, since
+                    // this is defense in depth, not the primary guarantee.
+                    try
+                    {
+                        DeleteKek(service, kProviderTypeTpm, kCurrentKeyId);
+                    }
+                    catch (const HkdfGuardError&)
+                    {
+                    }
+
                     CreateKekOnProvider(
                         service,
                         MS_KEY_STORAGE_PROVIDER,
@@ -762,12 +887,28 @@ namespace hkdfguard {
         // account's own per-user key store instead, where this key was never
         // created, and fail with NTE_BAD_KEYSET regardless of privileges.
         std::wstring name = KeyName(service, key_id);
-        status = NCryptOpenKey(result.provider.get(), result.key.put(), name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG);
+        // NCRYPT_SILENT_FLAG - see OpenKekOnProvider's comment on the
+        // identical addition there.
+        status = NCryptOpenKey(
+            result.provider.get(), result.key.put(), name.c_str(), 0,
+            NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
         if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenKey failed");
+            ThrowForNCryptFailure(status, "NCryptOpenKey failed");
         }
 
         KeyStoragePolicy policy = LoadEffectivePolicy();
+
+        // Unwrap doesn't switch over `policy` the way KekExists/CreateKek/
+        // OpenKekForWrap do (its provider/key selection comes entirely from
+        // the payload's own fields, not from policy), so it has no
+        // switch-with-trailing-throw to fall through into automatically.
+        // Checked explicitly instead: an invalid policy must not silently
+        // skip the RequireTpm-only hardware-backed check VerifyKeyProperties
+        // performs just below - that would let a misconfigured registry
+        // value quietly weaken verification on every unwrap.
+        if (policy == KeyStoragePolicy::Invalid) {
+            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_POLICY, "invalid key storage policy");
+        }
 
         VerifyKeyProperties(
             result.key.get(),
@@ -789,8 +930,13 @@ namespace hkdfguard {
         ScopedNCryptKey key;
         // Same NCRYPT_MACHINE_KEY_FLAG requirement as OpenKekForUnwrap above -
         // this key was created machine-wide, so it must also be opened (in
-        // order to then be deleted) machine-wide.
-        status = NCryptOpenKey(provider.get(), key.put(), name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG);
+        // order to then be deleted) machine-wide. NCRYPT_SILENT_FLAG too -
+        // see OpenKekOnProvider's comment on the identical addition there;
+        // no reason test cleanup should be able to block on a UI prompt
+        // either.
+        status = NCryptOpenKey(
+            provider.get(), key.put(), name.c_str(), 0,
+            NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
         if (status != ERROR_SUCCESS) {
             throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenKey failed");
         }

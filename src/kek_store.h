@@ -19,7 +19,11 @@ namespace hkdfguard {
     // KekExists/DeleteKek for setup and cleanup) is responsible for
     // supplying an already-normalized `service` itself if it wants that
     // same behavior.
-    constexpr uint32_t kCurrentKeyId = 1;
+    //
+    // kCurrentKeyId lives in wire_format.h (visible here via the #include
+    // above) - it's fundamentally a wire-format fact (the one KeyId value
+    // ParseWrappedDek ever accepts), not a kek_store-specific one, and this
+    // file just reuses it for the key name it builds.
 
     struct ResolvedKek {
         ScopedNCryptProv provider;
@@ -43,19 +47,20 @@ namespace hkdfguard {
     //
     // Responsibilities:
     //
+    //   - Read and validate the machine key-use group policy
+    //     (policy.h's LoadKeyUseGroupsPolicy + key_acl.h's
+    //     ValidateKeyUseGroups) - before touching the key store, so a bad
+    //     policy fails cleanly with HKDFGUARD_ERR_GROUP_INVALID and no key
     //   - Resolve effective TPM/software policy
     //   - Create KEK if missing
-    //   - Apply ACLs
+    //   - Apply ACLs (creation only - see hkdfguard.h)
     //   - Verify ACLs
     //   - Verify key properties
-    //
-    // The supplied groups receive unwrap/use access.
     //
     // Throws HkdfGuardError on failure.
     //
     void CreateKek(
-        const std::wstring& service,
-        const std::vector<std::wstring>& aclGroups);
+        const std::wstring& service);
 
     //
     // Opens an existing KEK for wrap operations.

@@ -36,7 +36,6 @@ using namespace hkdfguard;
 // what this construct does).
 namespace {
     constexpr size_t kMaxServiceLen = 128; // bytes, excluding the null terminator
-    constexpr size_t kMaxGroupsCsvLen = 8192; // bytes, excluding the null terminator
 
     // Validates that the incoming servicename is alphanumeric or period(dot)
     bool IsValidServiceChar(char c) noexcept {
@@ -172,6 +171,18 @@ namespace {
         // the service has no KEK yet.
         ResolvedKek kek = OpenKekForWrap(service_name);
 
+        // Fingerprint of the KEK this payload is being wrapped under: stamped
+        // into the payload and bound into the AAD below, so unwrap can both
+        // check it explicitly (before any ECDH) and authenticate it (see
+        // wire_format.h's layout comment).
+        uint8_t fingerprint[kFingerprintLen];
+        ComputeKekFingerprint(kek.key.get(), fingerprint);
+
+        // AAD = normalized service name || KEK fingerprint. None of it is
+        // secret; it just has to be reproduced byte-for-byte on unwrap.
+        std::vector<uint8_t> aad(normalized_service.begin(), normalized_service.end());
+        aad.insert(aad.end(), fingerprint, fingerprint + kFingerprintLen);
+
         // Ephemeral ECDH + HKDF-SHA512 -> 32-byte AES wrapping key. Only the
         // KEK's public key is needed here, so this never touches the TPM.
         uint8_t ephemeral_pub[kEphemeralPubLen];
@@ -200,119 +211,34 @@ namespace {
             DeriveWrappingKeyForWrap(kek.key.get(), ephemeral_pub, wrapping_key);
 
             // AES-256-GCM directly from the caller's dek pointer - no
-            // intermediate plaintext staging buffer. AAD is the
-            // case-normalized `normalized_service` bytes (not the caller's
-            // original-case `service`, and not the wide NCrypt-key-name form
-            // `service_name` above): binds this ciphertext to the exact
-            // (case-insensitive) service it was wrapped for, matching this
-            // project's macOS and Linux implementations, which use the
-            // identical AAD for the identical reason. Using the normalized
-            // form here - the same one ServiceToWide derived `service_name`
-            // from - is what makes wrap/unwrap genuinely case-insensitive
-            // end to end: if the raw `service` bytes were used instead, two
-            // calls that differ only in case would resolve to the same KEK
-            // but produce/expect different AAD, and unwrap would fail
-            // authentication.
+            // intermediate plaintext staging buffer. The AAD's service
+            // component is the case-normalized `normalized_service` bytes
+            // (not the caller's original-case `service`, and not the wide
+            // NCrypt-key-name form `service_name` above): it binds this
+            // ciphertext to the exact (case-insensitive) service it was
+            // wrapped for. Using the normalized form - the same one
+            // ServiceToWide derived `service_name` from - is what makes
+            // wrap/unwrap genuinely case-insensitive end to end: if the raw
+            // `service` bytes were used instead, two calls that differ only
+            // in case would resolve to the same KEK but produce/expect
+            // different AAD, and unwrap would fail authentication. The
+            // fingerprint component binds the ciphertext to the specific
+            // KEK, so neither the service nor the routing can be swapped
+            // undetected.
             AesGcmEncrypt(
                 wrapping_key.data(), dek, static_cast<unsigned long>(dek_len),
-                reinterpret_cast<const uint8_t *>(normalized_service.data()),
-                static_cast<unsigned long>(normalized_service.size()),
+                aad.data(), static_cast<unsigned long>(aad.size()),
                 nonce, ciphertext, tag);
         } // <- wrapping_key's destructor (zeroing it) runs here, right now.
 
-        // Assemble the final 132-byte payload directly into the caller's
+        // Assemble the final 164-byte payload directly into the caller's
         // buffer, and report how many bytes were written back through the
         // out-parameter.
-        SerializeWrappedDek(kek.provider_type, kek.key_id, ephemeral_pub, nonce, ciphertext, tag, out);
+        SerializeWrappedDek(kek.provider_type, kek.key_id, ephemeral_pub, nonce, ciphertext, tag, fingerprint, out);
         *out_len = static_cast<int32_t>(kTotalLen);
         return HKDFGUARD_OK;
     }
 
-    // Strips leading/trailing ASCII whitespace from `s`, so callers can write
-    // "group1, group2 , group3" without the surrounding spaces becoming part
-    // of the group name.
-    std::string Trim(const std::string &s) {
-        size_t begin = s.find_first_not_of(" \t\r\n");
-        if (begin == std::string::npos) {
-            return "";
-        }
-        size_t end = s.find_last_not_of(" \t\r\n");
-        return s.substr(begin, end - begin + 1);
-    }
-
-    std::vector<std::wstring> ParseAndConvertGroups(
-        const char *groups_csv) {
-        std::vector<std::wstring> result;
-
-        if (groups_csv == nullptr || *groups_csv == '\0') {
-            return result;
-        }
-
-        // Same strnlen-based bound as ValidateAndConvertService above, for the
-        // same reason: `groups_csv` is just a raw pointer with no length
-        // parameter alongside it, so this bounds how far this code ever reads
-        // in case the caller passed a buffer that isn't null-terminated
-        // within any reasonable length.
-        size_t len = strnlen(groups_csv, kMaxGroupsCsvLen + 1);
-        if (len > kMaxGroupsCsvLen) {
-            throw HkdfGuardError(
-                HKDFGUARD_ERR_INVALID_ARG,
-                "groups_csv is too long");
-        }
-
-        std::string csv(groups_csv, len);
-
-        size_t start = 0;
-
-        while (start < csv.size()) {
-            size_t comma = csv.find(',', start);
-
-            std::string token =
-                    Trim(
-                        (comma == std::string::npos)
-                            ? csv.substr(start)
-                            : csv.substr(start, comma - start));
-
-            if (!token.empty()) {
-                int wide_len =
-                        MultiByteToWideChar(
-                            CP_UTF8,
-                            MB_ERR_INVALID_CHARS,
-                            token.c_str(),
-                            static_cast<int>(token.size()),
-                            nullptr,
-                            0);
-
-                if (wide_len <= 0) {
-                    throw HkdfGuardError(
-                        HKDFGUARD_ERR_INVALID_ARG,
-                        "group name is not valid UTF-8");
-                }
-
-                std::wstring wide(
-                    static_cast<size_t>(wide_len),
-                    L'\0');
-
-                MultiByteToWideChar(
-                    CP_UTF8,
-                    MB_ERR_INVALID_CHARS,
-                    token.c_str(),
-                    static_cast<int>(token.size()),
-                    wide.data(),
-                    wide_len);
-
-                result.push_back(std::move(wide));
-            }
-
-            if (comma == std::string::npos) {
-                break;
-            }
-
-            start = comma + 1;
-        }
-
-        return result;
-    }
 } // namespace
 
 // `extern "C"` here (repeated at each function, rather than wrapping all of
@@ -379,18 +305,15 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_kek_exists(
 }
 
 extern "C" HKDFGUARD_API int32_t hkdfguard_create_kek(
-    const char *service,
-    const char *groups_csv) {
+    const char *service) {
     try {
         std::wstring service_name =
                 ValidateAndConvertService(service);
 
-        std::vector<std::wstring> groups =
-                ParseAndConvertGroups(groups_csv);
-
-        CreateKek(
-            service_name,
-            groups);
+        // Who may use the resulting KEK comes from machine policy (see
+        // hkdfguard.h and policy.h's LoadKeyUseGroupsPolicy), read and
+        // validated inside CreateKek - nothing about access is caller-chosen.
+        CreateKek(service_name);
 
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
@@ -485,8 +408,27 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
         // genuine WrappedDekV1 payload.
         ParsedWrappedDek parsed = ParseWrappedDek(wrapped, wrapped_len);
 
-        // Open (never create) the exact KEK that produced this payload.
+        // Open (never create) the KEK the payload's routing fields select.
         ResolvedKek kek = OpenKekForUnwrap(service_name, parsed.provider_type, parsed.key_id);
+
+        // Is that actually the KEK this payload was wrapped under? Compared
+        // before any ECDH so a payload for a different/rotated KEK fails
+        // fast and precisely (HKDFGUARD_ERR_KEK_MISMATCH), costing no TPM
+        // operation, rather than surfacing later as an authentication
+        // failure that looks identical to tampering. Not constant-time, and
+        // needn't be: both sides of the comparison are hashes of public
+        // keys. This is a check on the key the routing fields chose, never a
+        // search for a key that matches - see wire_format.h.
+        uint8_t expected_fingerprint[kFingerprintLen];
+        ComputeKekFingerprint(kek.key.get(), expected_fingerprint);
+        if (std::memcmp(expected_fingerprint, parsed.fingerprint, kFingerprintLen) != 0) {
+            throw HkdfGuardError(HKDFGUARD_ERR_KEK_MISMATCH, "payload was not wrapped under this KEK");
+        }
+
+        // Same AAD construction as WrapDekCore: normalized service name ||
+        // the payload's (now verified) fingerprint.
+        std::vector<uint8_t> aad(normalized_service.begin(), normalized_service.end());
+        aad.insert(aad.end(), parsed.fingerprint, parsed.fingerprint + kFingerprintLen);
 
         {
             // Same reasoning as the wrap side above: `wrapping_key` is
@@ -502,14 +444,13 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
 
             // Decrypt directly into the caller's buffer - no intermediate
             // plaintext staging buffer. AAD must match what AesGcmEncrypt
-            // used at wrap time: the case-normalized `normalized_service`
-            // bytes (see WrapDekCore's comment on why the normalized form,
-            // not the caller's original-case `service`, is what's used).
+            // used at wrap time (see WrapDekCore's comment on why the
+            // normalized service form, not the caller's original-case
+            // `service`, is what's used).
             AesGcmDecrypt(
                 wrapping_key.data(), parsed.nonce, parsed.ciphertext,
                 static_cast<unsigned long>(kCiphertextLen),
-                reinterpret_cast<const uint8_t *>(normalized_service.data()),
-                static_cast<unsigned long>(normalized_service.size()),
+                aad.data(), static_cast<unsigned long>(aad.size()),
                 parsed.tag, out);
         } // <- wrapping_key's destructor (zeroing it) runs here, right now.
 

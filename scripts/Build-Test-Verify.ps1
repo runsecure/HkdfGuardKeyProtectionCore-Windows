@@ -155,10 +155,10 @@ if ($cliExit -ne 0) {
 
 if ($cliExit -eq 0) {
     $wrapped = [System.IO.File]::ReadAllBytes($keyFile)
-    if ($wrapped.Length -ne 132) {
-        Write-Bad "wrapped file is $($wrapped.Length) bytes, expected 132"
+    if ($wrapped.Length -ne 164) {
+        Write-Bad "wrapped file is $($wrapped.Length) bytes, expected 164"
     } else {
-        Write-Ok "wrapped file is the expected 132 bytes"
+        Write-Ok "wrapped file is the expected 164 bytes"
     }
 
     $providerType = $wrapped[1]
@@ -221,7 +221,9 @@ if (-not $NoCleanup) {
         Write-Host "removed $keyFile"
     }
     if ($providerName) {
-        $keyName = "HkdfGuardWin_${service}_v1"
+        # Matches kek_store.cpp's KeyName(): every piece of the persisted
+        # name is lowercase, and $service is already lowercase.
+        $keyName = "hkdfguardwin_${service}_v1"
         & certutil -csp $providerName -delkey $keyName | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Host "removed persisted KEK '$keyName' from $providerName"

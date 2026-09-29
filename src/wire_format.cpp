@@ -6,7 +6,7 @@
 #include <cstring>
 
 namespace hkdfguard {
-    // Builds the 132-byte wire payload by writing each field at its known
+    // Builds the 164-byte wire payload by writing each field at its known
     // offset. Every field here is public information (metadata, a public
     // ephemeral key, ciphertext, and an auth tag) - nothing in this function
     // handles a secret, so there's no zeroing concern in this file.
@@ -17,6 +17,7 @@ namespace hkdfguard {
         const uint8_t nonce[kNonceLen],
         const uint8_t ciphertext[kCiphertextLen],
         const uint8_t tag[kTagLen],
+        const uint8_t fingerprint[kFingerprintLen],
         uint8_t out[kTotalLen]) {
         // Single-byte fields: just assign directly at their offset.
         out[kVersionOffset] = kFormatVersion1;
@@ -50,6 +51,7 @@ namespace hkdfguard {
         memcpy(out + kNonceOffset, nonce, kNonceLen);
         memcpy(out + kCiphertextOffset, ciphertext, kCiphertextLen);
         memcpy(out + kTagOffset, tag, kTagLen);
+        memcpy(out + kFingerprintOffset, fingerprint, kFingerprintLen);
     }
 
     // Validates a caller-supplied buffer really is a well-formed WrappedDekV1
@@ -79,6 +81,15 @@ namespace hkdfguard {
             throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "unrecognized wrapped payload version");
         }
 
+        // The reserved bytes must be exactly what SerializeWrappedDek wrote.
+        // They carry no meaning today, but leaving them unchecked would mean
+        // any future meaning assigned to them could be flipped undetected in
+        // an existing payload - so they're pinned to zero now, while nothing
+        // depends on them.
+        if (wrapped[kReservedOffset] != 0 || wrapped[kReservedOffset + 1] != 0) {
+            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "reserved bytes must be zero");
+        }
+
         uint8_t provider_type = wrapped[kProviderTypeOffset];
         if (provider_type != kProviderTypeTpm && provider_type != kProviderTypeSoftware) {
             throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "unrecognized provider type");
@@ -98,6 +109,18 @@ namespace hkdfguard {
                 (static_cast<uint32_t>(wrapped[kKeyIdOffset + 2]) << 16) |
                 (static_cast<uint32_t>(wrapped[kKeyIdOffset + 3]) << 24);
 
+        // See kCurrentKeyId's comment: this format version has no rotation
+        // mechanism, so exactly one KeyId value is ever legitimate. Rejecting
+        // anything else here - rather than letting it flow through to
+        // kek_store.cpp's KeyName, which would just build a persisted-key
+        // name for a key that, by design, was never created - turns a
+        // payload with a tampered or simply wrong KeyId into an immediate,
+        // precise HKDFGUARD_ERR_MALFORMED instead of a less specific
+        // "provider/key open failed" further down the call chain.
+        if (key_id != kCurrentKeyId) {
+            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "unrecognized key id");
+        }
+
         // `ParsedWrappedDek parsed{};` default-constructs the struct with every
         // member zero-initialized (the `{}` is "empty brace-init"), then each
         // field is filled in explicitly below. The four pointer fields are set
@@ -111,6 +134,7 @@ namespace hkdfguard {
         parsed.nonce = wrapped + kNonceOffset;
         parsed.ciphertext = wrapped + kCiphertextOffset;
         parsed.tag = wrapped + kTagOffset;
+        parsed.fingerprint = wrapped + kFingerprintOffset;
         // Returned by value - see the "returning by value" note on this
         // function's declaration in wire_format.h.
         return parsed;

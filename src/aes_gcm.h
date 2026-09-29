@@ -13,11 +13,11 @@ namespace hkdfguard {
     // `plaintext` and writes directly into `ciphertext_out` - no additional
     // staging buffer. Throws HkdfGuardError on failure.
     //
-    // hkdfguard.cpp passes the caller's `service` string (as raw UTF-8 bytes,
-    // not the wide/NCrypt-key-name form) as `aad` here - see its call sites for
-    // why: it's what binds a wrapped payload to the exact service it was
-    // wrapped for, matching this project's macOS and Linux implementations,
-    // which use the identical AAD for the identical reason.
+    // hkdfguard.cpp passes `normalized service name || KEK fingerprint` as
+    // `aad` here - see its call sites and wire_format.h for why: it's what
+    // binds a wrapped payload to both the exact service and the specific KEK
+    // it was wrapped under, matching the construction this project's macOS
+    // and Linux implementations use.
     //
     // `unsigned long` (rather than this project's usual uint32_t/int32_t) is
     // used for the length parameters purely because that's the literal type

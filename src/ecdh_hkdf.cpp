@@ -308,6 +308,67 @@ namespace hkdfguard {
         }
     } // namespace
 
+    void ValidateEphemeralPublicKey(const uint8_t pub[kEphemeralPubLen]) {
+        ScopedBCryptAlg ecdh_alg;
+        NTSTATUS status = BCryptOpenAlgorithmProvider(ecdh_alg.put(), BCRYPT_ECDH_P256_ALGORITHM, nullptr, 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            // Infrastructure failure (can't even open the software provider),
+            // not a verdict on the point - reported as CRYPTO, not MALFORMED,
+            // so a caller can't mistake it for "the payload is bad."
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "open ECDH provider failed");
+        }
+        try {
+            // The import itself is the validation: the software provider
+            // rejects any X||Y that isn't a point on P-256 (see
+            // SecurityAssumptions.md for the fuzzing that established this).
+            // The resulting key object is discarded immediately - only the
+            // accept/reject verdict is wanted here.
+            ImportBCryptEccPublicKey(ecdh_alg.get(), pub);
+        } catch (const HkdfGuardError &) {
+            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "ephemeral public key is not a valid P-256 point");
+        }
+    }
+
+    void ComputeKekFingerprint(NCRYPT_KEY_HANDLE kek_key, uint8_t out[kFingerprintLen]) {
+        uint8_t kek_pub[kEphemeralPubLen];
+        ExportNCryptEccPublicKey(kek_key, kek_pub);
+
+        // Plain (unkeyed) SHA-256 via CNG - the same Create/HashData/Finish
+        // sequence HmacSha512 above uses, minus the HMAC flag and key.
+        ScopedBCryptAlg alg;
+        NTSTATUS status = BCryptOpenAlgorithmProvider(alg.put(), BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "open SHA-256 provider failed");
+        }
+
+        DWORD hash_object_len = 0, cb_result = 0;
+        status = BCryptGetProperty(
+            alg.get(), BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&hash_object_len), sizeof(hash_object_len), &cb_result, 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "query SHA-256 object length failed");
+        }
+
+        std::vector<uint8_t> hash_object(hash_object_len);
+        ScopedBCryptHash hash;
+        status = BCryptCreateHash(alg.get(), hash.put(), hash_object.data(), hash_object_len, nullptr, 0, 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptCreateHash(SHA-256) failed");
+        }
+
+        status = BCryptHashData(hash.get(), kek_pub, static_cast<ULONG>(kEphemeralPubLen), 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptHashData(SHA-256) failed");
+        }
+
+        status = BCryptFinishHash(hash.get(), out, static_cast<ULONG>(kFingerprintLen), 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptFinishHash(SHA-256) failed");
+        }
+        // Nothing here is secret (a public key and its public hash), so no
+        // zeroing is needed beyond the RAII handles closing themselves.
+    }
+
     void DeriveWrappingKeyForWrap(
         NCRYPT_KEY_HANDLE kek_key,
         uint8_t ephemeral_pub_out[kEphemeralPubLen],
@@ -414,29 +475,67 @@ namespace hkdfguard {
         NCRYPT_KEY_HANDLE kek_key,
         const uint8_t ephemeral_pub[kEphemeralPubLen],
         SecureBuffer<32> &wrapping_key_out) {
-        // Same first step as the wrap side: fetch the KEK's public key, this
-        // time only so it can be mixed into the HKDF info string identically to
-        // how the wrap side computed it (the private key is what actually gets
-        // used for the ECDH step below).
+        // `ephemeral_pub` points directly into the caller's wrapped-payload
+        // buffer (see hkdfguard.cpp's ParsedWrappedDek - it aliases the
+        // original `wrapped` pointer, nothing is copied yet at this point),
+        // which - unlike a buffer this function owns - could in principle be
+        // mutated by another thread in the same host process between one
+        // read of it and the next. Copied into a local, fixed array exactly
+        // once, right here, before anything else touches it: every
+        // subsequent use in this function (the validation below, the blob
+        // built for NCryptImportKey, and the HKDF info string) reads *this*
+        // copy, never the caller's buffer again. Without this,
+        // ValidateEphemeralPublicKey could validate one set of bytes while
+        // NCryptImportKey/NCryptSecretAgreement below are handed a different,
+        // never-validated set read moments later - reopening the exact
+        // invalid-curve attack surface that validation exists to close,
+        // through a check-then-use race rather than a missing check.
+        uint8_t ephemeral_pub_copy[kEphemeralPubLen];
+        memcpy(ephemeral_pub_copy, ephemeral_pub, kEphemeralPubLen);
+
+        // `ephemeral_pub_copy` is the one input to this whole function that
+        // an attacker controls outright (it's read straight out of the
+        // wrapped payload), and it's about to be combined with the
+        // long-term KEK *private* key in NCryptSecretAgreement below -
+        // exactly the setup for an invalid-curve / small-subgroup attack if
+        // an off-curve point were ever accepted. Reject it here, through the
+        // software provider whose point validation this project has
+        // actually fuzzed, before it reaches NCryptImportKey on whichever
+        // KSP the payload's ProviderType byte selected - so the TPM path is
+        // protected by the same verified check as the software path, rather
+        // than each KSP's own untested import validation.
+        ValidateEphemeralPublicKey(ephemeral_pub_copy);
+
+        // Fetch the KEK's public key too, only so it can be mixed into the
+        // HKDF info string identically to how the wrap side computed it
+        // (the private key is what actually gets used for the ECDH step
+        // below).
         uint8_t kek_pub[kEphemeralPubLen];
         ExportNCryptEccPublicKey(kek_key, kek_pub);
 
-        // Rebuild a BCRYPT_ECCPUBLIC_BLOB (header + X||Y) from the ephemeral
-        // public key bytes that travelled in the wrapped payload - same layout
-        // ImportBCryptEccPublicKey builds, but this one needs to become an
-        // *NCrypt* key (via NCryptImportKey just below) rather than a BCrypt
-        // one, since it has to be paired with the NCrypt-managed KEK private
-        // key for the agreement call that follows.
+        // Rebuild a BCRYPT_ECCPUBLIC_BLOB (header + X||Y) from the
+        // now-validated local copy - same layout ImportBCryptEccPublicKey
+        // builds, but this one needs to become an *NCrypt* key (via
+        // NCryptImportKey just below) rather than a BCrypt one, since it has
+        // to be paired with the NCrypt-managed KEK private key for the
+        // agreement call that follows.
         std::vector<uint8_t> ephemeral_blob(sizeof(BCRYPT_ECCKEY_BLOB) + kEphemeralPubLen);
         auto *header = reinterpret_cast<BCRYPT_ECCKEY_BLOB *>(ephemeral_blob.data());
         header->dwMagic = BCRYPT_ECDH_PUBLIC_P256_MAGIC;
         header->cbKey = 32;
-        memcpy(ephemeral_blob.data() + sizeof(BCRYPT_ECCKEY_BLOB), ephemeral_pub, kEphemeralPubLen);
+        memcpy(ephemeral_blob.data() + sizeof(BCRYPT_ECCKEY_BLOB), ephemeral_pub_copy, kEphemeralPubLen);
 
+        // NCRYPT_SILENT_FLAG on both calls below: without it, a pre-planted
+        // key or import target with a UI-requiring protection policy could
+        // make either call display a credential/consent prompt - or block
+        // indefinitely waiting for one - inside what is typically a
+        // non-interactive service process. With it, such a case fails with
+        // an error instead. Confirmed accepted (not NTE_BAD_FLAGS) by both
+        // NCryptImportKey and NCryptSecretAgreement empirically.
         ScopedNCryptKey ephemeral_ncrypt_key;
         SECURITY_STATUS status = NCryptImportKey(
             provider, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, ephemeral_ncrypt_key.put(),
-            ephemeral_blob.data(), static_cast<DWORD>(ephemeral_blob.size()), 0);
+            ephemeral_blob.data(), static_cast<DWORD>(ephemeral_blob.size()), NCRYPT_SILENT_FLAG);
         if (status != ERROR_SUCCESS) {
             throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "NCryptImportKey(ephemeral public) failed");
         }
@@ -445,7 +544,7 @@ namespace hkdfguard {
         // This is the one step that may execute inside a TPM/vTPM, since
         // kek_key's private part may be non-exportable hardware-backed key
         // material.
-        status = NCryptSecretAgreement(kek_key, ephemeral_ncrypt_key.get(), secret.put(), 0);
+        status = NCryptSecretAgreement(kek_key, ephemeral_ncrypt_key.get(), secret.put(), NCRYPT_SILENT_FLAG);
         // The imported ephemeral *public* key isn't secret itself, but it's no
         // longer needed either way once the agreement has been computed, so
         // it's released promptly rather than left open until function return.
@@ -458,13 +557,18 @@ namespace hkdfguard {
         ExtractRawSecretFromNCrypt(secret.get(), raw_secret);
         secret.reset(); // shared secret is highly sensitive; destroy immediately once extracted
 
-        // Identical HKDF construction to the wrap side, with `ephemeral_pub`
-        // and `kek_pub` swapped in the same argument order BuildHkdfInfo used
-        // on the wrap side (ephemeral first, then KEK) - this is what makes the
-        // two sides' `info` bytes byte-for-byte identical, which combined with
-        // the byte-for-byte-identical raw shared secret is what guarantees both
-        // sides derive the exact same wrapping key.
-        std::vector<uint8_t> info = BuildHkdfInfo(ephemeral_pub, kek_pub);
+        // Identical HKDF construction to the wrap side, with
+        // `ephemeral_pub_copy` and `kek_pub` swapped in the same argument
+        // order BuildHkdfInfo used on the wrap side (ephemeral first, then
+        // KEK) - this is what makes the two sides' `info` bytes
+        // byte-for-byte identical, which combined with the
+        // byte-for-byte-identical raw shared secret is what guarantees both
+        // sides derive the exact same wrapping key. Using the local copy
+        // here too (not the caller's `ephemeral_pub` pointer) keeps this
+        // consistent with the point that was actually validated and used
+        // for the ECDH step above, rather than risking a third, independent
+        // read of the live payload buffer.
+        std::vector<uint8_t> info = BuildHkdfInfo(ephemeral_pub_copy, kek_pub);
         HkdfSha512(raw_secret.data(), raw_secret.size(), info, wrapping_key_out);
         // As on the wrap side, `raw_secret` is wiped automatically here as the
         // function returns, immediately after its only use above.

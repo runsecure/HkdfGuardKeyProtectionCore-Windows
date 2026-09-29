@@ -71,7 +71,7 @@ extern "C" {
 // ever runs. This is the traditional C way of naming a constant so it can
 // also be used where the language requires a compile-time literal.
 #define HKDFGUARD_DEK_LEN     32
-#define HKDFGUARD_WRAPPED_LEN 132 /* fixed size of a WrappedDekV1 payload */
+#define HKDFGUARD_WRAPPED_LEN 164 /* fixed size of a WrappedDekV1 payload (incl. 32-byte KEK fingerprint) */
 
 // Status codes. HKDFGUARD_OK is 0 (following the common C convention that
 // "0 means success"); every failure is a distinct *negative* number, so a
@@ -92,6 +92,10 @@ extern "C" {
 #define HKDFGUARD_ERR_INTERNAL         (-7) /* unexpected internal failure */
 #define HKDFGUARD_ERR_SERVICE_NAME_INVALID (-8) /* Service Name is malformed or invalid */
 #define HKDFGUARD_ERR_INVALID_POLICY   (-9) /* Invalid Key Storage Policy Flag */
+#define HKDFGUARD_ERR_GROUP_INVALID   (-10) /* KeyUseGroups policy entry is unresolvable, not a group, or over-broad */
+#define HKDFGUARD_ERR_KEK_MISMATCH    (-11) /* payload's KEK fingerprint does not match the KEK it routes to */
+#define HKDFGUARD_ERR_KEK_NOT_FOUND   (-12) /* no KEK is provisioned for this service (call hkdfguard_create_kek first) */
+#define HKDFGUARD_ERR_ACCESS_DENIED   (-13) /* this KEK exists, but the calling account is not authorized to use it */
 
 /*
  * Reports whether a persistent KEK already exists for `service`, without
@@ -101,7 +105,10 @@ extern "C" {
  * out_exists  - caller-owned output. On success, set to 1 if the KEK exists,
  *               0 otherwise.
  *
- * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
+ * including HKDFGUARD_ERR_ACCESS_DENIED if a KEK is present but the
+ * calling account cannot even open it to confirm that (existence could not
+ * be determined, as opposed to *out_exists being a reliable 0).
  * *out_exists is left untouched on failure.
  */
 HKDFGUARD_API int32_t hkdfguard_kek_exists(
@@ -113,17 +120,43 @@ HKDFGUARD_API int32_t hkdfguard_kek_exists(
  * verifies its properties if it does. Safe to call more than once for the
  * same service.
  *
- * service     - see hkdfguard_wrap_dek.
- * groups_csv  - comma-separated list of group names to grant unwrap/use
- *               access to. May be null or empty for no additional groups.
- *               Whitespace around each name is trimmed. At most 8192 bytes
- *               (excluding the null terminator).
+ * Which principals may use (unwrap with) the KEK is machine policy, not a
+ * caller choice. SYSTEM and BUILTIN\Administrators always receive full
+ * control. In addition, every entry of the REG_MULTI_SZ registry value
  *
- * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ *     HKLM\Software\Policies\HkdfGuard\KeyUseGroups
+ *
+ * is granted key-use access when the KEK is created. An entry is either a
+ * group name (e.g. "MYDOMAIN\KeyUsers", "Cryptographic Operators") or a SID
+ * string (e.g. "S-1-5-21-...-1234"); surrounding whitespace is ignored.
+ * Each entry must resolve to a group - a user or computer account is
+ * rejected - and must not be an over-broad principal: Everyone,
+ * Authenticated Users, Users, Guests, Anonymous, NULL SID, or the logon-type
+ * groups INTERACTIVE, NETWORK, BATCH and SERVICE. It must also be
+ * host-local: a group in this machine's own SAM, or a BUILTIN, NT AUTHORITY
+ * or NT SERVICE principal. This protection is host-specific, so domain
+ * groups are rejected even on a domain-joined machine, whether written
+ * domain-qualified or not. Any entry failing these checks fails the whole
+ * call with HKDFGUARD_ERR_GROUP_INVALID before any key is created. A
+ * missing or empty value grants no additional principals.
+ *
+ * The ACL is applied only when the KEK is first created. Changing the
+ * policy afterwards does not alter an existing KEK's ACL; a later call for
+ * an already-provisioned service verifies the key and returns HKDFGUARD_OK
+ * without modifying access.
+ *
+ * service - see hkdfguard_wrap_dek.
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
+ * notably HKDFGUARD_ERR_ACCESS_DENIED, which covers two distinct cases: the
+ * service's KEK already exists but the calling account cannot even open it
+ * to verify it, or the KEK does not exist yet and this process is not
+ * elevated (creating a *new* machine-scoped KEK requires an elevated
+ * process - opening/using an existing one does not; see the "Deployment
+ * model" note in README.md).
  */
 HKDFGUARD_API int32_t hkdfguard_create_kek(
-    const char* service,
-    const char* groups_csv);
+    const char* service);
 
 /*
  * Wraps a 32-byte DEK into a self-contained, versioned payload.
@@ -149,9 +182,12 @@ HKDFGUARD_API int32_t hkdfguard_create_kek(
  *             out: on success, the number of bytes written (always
  *             HKDFGUARD_WRAPPED_LEN).
  *
- * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code
- * (including HKDFGUARD_ERR_PROVIDER if the service has no KEK yet).
- * On failure, no partial output is left in the caller's buffer.
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
+ * notably HKDFGUARD_ERR_KEK_NOT_FOUND if hkdfguard_create_kek has not yet
+ * provisioned this service's KEK, or HKDFGUARD_ERR_ACCESS_DENIED if it has
+ * but the calling account is not authorized to use it (see
+ * hkdfguard_create_kek's KeyUseGroups policy). On failure, no partial
+ * output is left in the caller's buffer.
 */
 
 HKDFGUARD_API int32_t hkdfguard_wrap_dek(
@@ -172,6 +208,16 @@ HKDFGUARD_API int32_t hkdfguard_wrap_dek(
  *               (always HKDFGUARD_DEK_LEN).
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ * HKDFGUARD_ERR_MALFORMED covers both a structurally invalid payload and a
+ * payload whose embedded ephemeral public key is not a valid P-256 point
+ * (rejected before it ever reaches the KEK). HKDFGUARD_ERR_KEK_MISMATCH
+ * means the payload is well-formed but was wrapped under a different KEK
+ * than the one this service currently routes to (its embedded KEK
+ * fingerprint doesn't match) - detected before any ECDH or decryption is
+ * attempted, and distinct from HKDFGUARD_ERR_AUTH_FAILED, which now
+ * indicates tampering with a payload that *does* belong to this KEK.
+ * HKDFGUARD_ERR_KEK_NOT_FOUND and HKDFGUARD_ERR_ACCESS_DENIED are as
+ * described on hkdfguard_wrap_dek.
  * On any failure (including authentication failure), the output buffer is
  * zeroed before returning; no plaintext is left behind.
  */

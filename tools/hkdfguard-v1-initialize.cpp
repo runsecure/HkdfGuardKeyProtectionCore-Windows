@@ -2,17 +2,25 @@
 // persistent, machine-wide, TPM-backed (or software-fallback) KEK and
 // writes the wrapped payload to a file.
 //
-// Calls into hkdfguard.dll through its stable C ABI (hkdfguard_wrap_dek),
-// the same interface any other-language caller uses - this tool links only
-// against include/hkdfguard.h and the hkdfguard import library, nothing
-// from src/. Mirrors this project's macOS and Linux equivalents
+// Calls into hkdfguard.dll through its stable C ABI - hkdfguard_kek_exists
+// and hkdfguard_create_kek to provision the service's machine-wide KEK on
+// first use, then hkdfguard_wrap_dek - the same interface any
+// other-language caller uses; this tool links only against
+// include/hkdfguard.h and the hkdfguard import library, nothing from src/.
+// Mirrors this project's macOS and Linux equivalents
 // (hkdfguard-v1-initialize) argument-for-argument, with one Windows-only
 // addition: --group|-g. Windows has no POSIX-style implicit "group" the
 // way 0640 relies on for those two platforms, so the caller names one
 // explicitly here instead.
 //
 // The KEK's `service` identity is exactly --service-name's value, passed
-// straight through to hkdfguard_wrap_dek as `service`.
+// straight through to the hkdfguard_* calls as `service`. The KEK itself
+// is meant to be long-lived: DEKs are re-minted every release under the
+// same service name, and if a genuinely new KEK is ever wanted, the
+// service name is simply versioned (e.g. "myapp.v2") - there is no in-place
+// key rotation. Creating a KEK (the first run for a given service name)
+// needs an elevated process; wrapping against an existing one does not,
+// subject to the key's ACL.
 //
 // Usage:
 //   hkdfguard-v1-initialize <key-file-path> \
@@ -78,10 +86,9 @@ namespace {
     // This tool's own operational-error type - deliberately not reusing the
     // DLL's internal HkdfGuardError (src/errors.h), since this tool depends
     // only on the public C ABI (include/hkdfguard.h) and the import library,
-    // nothing from src/. Carries a wide message directly (rather than a narrow
-    // std::string) since almost everything this tool reports on - file paths,
-    // group/service names, FormatMessageW output - is naturally wide already;
-    // this avoids constant narrow/wide conversion at every throw site.
+    // nothing from src/. Carries a narrow std::string message, matching the
+    // narrow (non-UNICODE) Win32 API variants and std::string arguments this
+    // tool uses throughout - so every fprintf of it must use %s, never %ls.
     struct CliError {
         std::string message;
 
@@ -261,12 +268,18 @@ namespace {
         switch (code) {
             case HKDFGUARD_OK: return "success";
             case HKDFGUARD_ERR_INVALID_ARG: return "invalid argument (bad service name or DEK length)";
-            case HKDFGUARD_ERR_BUFFER_TOO_SMALL: return "output buffer too smal";
+            case HKDFGUARD_ERR_BUFFER_TOO_SMALL: return "output buffer too small";
             case HKDFGUARD_ERR_PROVIDER: return "KEK provider/key open or create failed";
             case HKDFGUARD_ERR_CRYPTO: return "a cryptographic operation failed";
             case HKDFGUARD_ERR_AUTH_FAILED: return "AES-GCM authentication failed";
             case HKDFGUARD_ERR_MALFORMED: return "wrapped payload is not valid";
-            case HKDFGUARD_ERR_INTERNAL: return "an internal error occurred in hkdfguard.dl";
+            case HKDFGUARD_ERR_INTERNAL: return "an internal error occurred in hkdfguard.dll";
+            case HKDFGUARD_ERR_SERVICE_NAME_INVALID: return "service name is malformed (ASCII letters, digits and '.' only, 1-128 bytes)";
+            case HKDFGUARD_ERR_INVALID_POLICY: return "invalid key storage policy";
+            case HKDFGUARD_ERR_GROUP_INVALID: return "a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local";
+            case HKDFGUARD_ERR_KEK_MISMATCH: return "wrapped payload was not produced under this service's current KEK";
+            case HKDFGUARD_ERR_KEK_NOT_FOUND: return "no KEK is provisioned for this service";
+            case HKDFGUARD_ERR_ACCESS_DENIED: return "this KEK exists, but this account is not authorized to use it";
             default: return "unknown status code " + std::to_string(code);
         }
     }
@@ -296,8 +309,47 @@ namespace {
         return wrapped;
     }
 
+    // Makes sure the service's machine-wide KEK exists, creating it if not.
+    // hkdfguard_wrap_dek never creates a KEK, so a first deployment for a
+    // new service name must provision it here. Called only after every
+    // argument (including --dek) has been validated, since creating a KEK
+    // is a persistent side effect that a later argument error must not
+    // leave behind. A provisioning failure is typically "not elevated" or
+    // a rejected KeyUseGroups policy entry. Which principals may later
+    // unwrap, and whether the KEK is TPM- or software-backed, come from the
+    // machine's registry policy, not from this tool - see include/hkdfguard.h.
+    void EnsureKekProvisioned(const std::string &service) {
+        int32_t exists = 0;
+        int32_t rc = hkdfguard_kek_exists(service.c_str(), &exists);
+        if (rc != HKDFGUARD_OK) {
+            throw CliError("hkdfguard_kek_exists failed: " + DescribeStatus(rc));
+        }
+
+        if (exists != 0) {
+            fprintf(stdout, "using existing KEK for service \"%s\"\n", service.c_str());
+            return;
+        }
+
+        rc = hkdfguard_create_kek(service.c_str());
+        if (rc != HKDFGUARD_OK) {
+            std::string message = "hkdfguard_create_kek failed: " + DescribeStatus(rc);
+            // HKDFGUARD_ERR_ACCESS_DENIED, not HKDFGUARD_ERR_PROVIDER, is
+            // what a non-elevated process actually gets here: creating a
+            // *new* machine-scoped KEK succeeds right up through
+            // NCryptCreatePersistedKey and its property-setting calls, and
+            // is only rejected (as NTE_PERM) when NCryptFinalizeKey tries
+            // to commit it - see kek_store.cpp's ThrowForNCryptFailure.
+            if (rc == HKDFGUARD_ERR_ACCESS_DENIED) {
+                message += " (creating a new KEK requires an elevated process; this account may lack rights)";
+            }
+            throw CliError(message);
+        }
+
+        fprintf(stdout, "created KEK for service \"%s\"\n", service.c_str());
+    }
+
     // Enforces that --service-name - the exact value passed to
-    // hkdfguard_wrap_dek as `service` - contains only ASCII alphanumeric
+    // the hkdfguard_* calls as `service` - contains only ASCII alphanumeric
     // characters or '.', matching this project's macOS/Linux tools.
     void ValidateServiceCharset(const std::string &service) {
         for (wchar_t c: service) {
@@ -653,7 +705,7 @@ namespace {
             // inherent, unavoidable argv-visibility limitation -- it erases
             // the one copy this code actually controls, which is the one
             // thing zeroing it here can actually fix.
-            SecureZeroMemory(args.dekBase64.data(), args.dekBase64.size() * sizeof(wchar_t));
+            SecureZeroMemory(args.dekBase64.data(), args.dekBase64.size());
             args.dekBase64.clear();
 
             // Zeroes `dek` -- up to its *capacity*, not just its current
@@ -681,6 +733,13 @@ namespace {
                     std::to_string(dek.size()));
             }
 
+            // Provision (or confirm) the KEK only now - after every argument
+            // has been validated - because creating a KEK is a persistent,
+            // machine-wide side effect: a malformed --dek must not leave a
+            // freshly-created KEK behind. `dek` stays in memory for the one
+            // extra NCrypt call this costs, still under dekGuard's wipe.
+            EnsureKekProvisioned(service);
+
             wrapped = WrapDek(service, dek);
             // dekGuard zeroes `dek` here, as this block ends -- immediately
             // after WrapDek returns the wrapped (encrypted, no longer secret)
@@ -694,7 +753,7 @@ namespace {
         WriteWrappedKeyFile(args.keyFilePath, wrapped, security);
 
         fprintf(
-            stdout, "wrapped key written to %ls (%zu bytes, owner read/write + %ls read-only, service \"%ls\")\n",
+            stdout, "wrapped key written to %s (%zu bytes, owner read/write + %s read-only, service \"%s\")\n",
             args.keyFilePath.c_str(), wrapped.size(), args.groupName.c_str(), service.c_str());
     }
 } // namespace
@@ -707,7 +766,7 @@ int main(int argc, char *argv[]) {
             return 0;
         }
     } catch (const CliError &e) {
-        fprintf(stderr, "error: %ls\n", e.message.c_str());
+        fprintf(stderr, "error: %s\n", e.message.c_str());
         PrintUsage();
         return 2;
     }
@@ -716,7 +775,7 @@ int main(int argc, char *argv[]) {
         Run(args);
         return 0;
     } catch (const CliError &e) {
-        fprintf(stderr, "error: %ls\n", e.message.c_str());
+        fprintf(stderr, "error: %s\n", e.message.c_str());
         return 1;
     } catch (const std::exception &e) {
         fprintf(stderr, "error: %hs\n", e.what());
