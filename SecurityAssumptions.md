@@ -195,7 +195,7 @@ that is many services at once - an administrator's choice. The two fixed
 optional groups (`HkdfGuardAdmins` -> full control, `HkdfGuardUsers` ->
 use) are still granted by *name*, now restricted to local groups.
 
-## 9. ACL enforcement and `GENERIC_READ` (design decision + assumed)
+## 9. ACL enforcement and `GENERIC_READ` (design decision + verified)
 
 - The KEK's ACL is applied once, at creation, and never re-verified on open:
   the OS enforces the DACL on every use, so an unauthorized caller gets
@@ -206,11 +206,15 @@ use) are still granted by *name*, now restricted to local groups.
 - Key-use access is granted as `GENERIC_READ` on the key object, on the
   understanding that for CNG KSP keys read access permits using the private
   key (`NCryptSecretAgreement`) while `GENERIC_WRITE`/`GENERIC_ALL` are
-  needed to modify or delete it. **Assumed / not verified**: the elevated
-  test runs wrap and unwrap as the same administrator account; no test has
-  yet exercised unwrap from a principal that holds *only* a `KeyUseGroups`
-  grant. This is the single most valuable untested assumption in the
-  project and should be checked before relying on the ACL for isolation.
+  needed to modify or delete it. **Verified.** A genuinely non-administrator
+  local account - a member of the local `HkdfGuardUsers` group and nothing
+  else (confirmed not in `Administrators`) - successfully wrapped a DEK via
+  the CLI and unwrapped it via a direct call into the DLL, with no
+  elevation, on the strength of that `GENERIC_READ` grant alone. The same
+  account's attempt to *provision* a brand-new KEK failed as expected
+  (`HKDFGUARD_ERR_ACCESS_DENIED`, elevation required), confirming creation
+  and use are genuinely governed by separate mechanisms (elevation vs.
+  ACL). Both the KEK and the test account/group were removed afterward.
 
 ## 10. Payload integrity and the KEK fingerprint (verified where noted)
 
@@ -259,4 +263,3 @@ use) are still granted by *name*, now restricted to local groups.
   in-process - and requires the Spectre-mitigated libraries with `/MT`.
 - Only one TPM vendor/firmware has been exercised (section 4); other
   Platform Crypto Provider backends may exhibit different quirks.
-- The `GENERIC_READ`-as-use assumption (section 9) is untested.
