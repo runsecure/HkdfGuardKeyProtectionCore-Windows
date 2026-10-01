@@ -81,6 +81,23 @@ namespace hkdfguard {
     // widen who can unwrap its DEKs; only a machine administrator can.
     std::vector<std::wstring> LoadKeyUseGroupsPolicy();
 
+    // Whether a successful unwrap writes audit event 1003 (see
+    // event_log.h), from the REG_DWORD value
+    // HKLM\Software\Policies\HkdfGuard\AuditUnwrapSuccess. Read on every
+    // successful unwrap, so a change takes effect without restarting the
+    // calling process. Never throws.
+    //
+    // Only an explicit REG_DWORD 0 turns the event off. A missing value, a
+    // non-zero DWORD, a value of the wrong type, or any read failure all
+    // mean "on": a misconfigured value must never silently reduce auditing.
+    // Wrap events and every failure event are written regardless.
+    bool LoadAuditUnwrapSuccess() noexcept;
+
+    // The value-to-setting rule LoadAuditUnwrapSuccess applies, with no
+    // registry I/O, so it can be tested directly. `found` is false when the
+    // key or value doesn't exist (or can't be read).
+    bool ParseAuditUnwrapSuccess(bool found, unsigned long type, unsigned long value) noexcept;
+
     // Test-only seam for LoadKeyUseGroupsPolicy(), with exactly the same
     // scope and caveats as SetTestPolicyOverride above: compiled in only
     // for test binaries, absent from hkdfguard.dll. std::nullopt clears it.

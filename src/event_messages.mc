@@ -24,6 +24,18 @@ Language=English
 %1
 .
 
+MessageId=1002
+SymbolicName=HKDFGUARD_EVT_DEK_WRAPPED
+Language=English
+%1
+.
+
+MessageId=1003
+SymbolicName=HKDFGUARD_EVT_DEK_UNWRAPPED
+Language=English
+%1
+.
+
 MessageId=2000
 SymbolicName=HKDFGUARD_EVT_ACCESS_DENIED
 Language=English

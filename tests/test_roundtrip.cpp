@@ -253,6 +253,22 @@ int main() {
     std::vector<uint8_t> dek = MakeDek();
     int32_t rc;
 
+    // ---- -2. The AuditUnwrapSuccess switch: only an explicit REG_DWORD 0 ----
+    //           turns the unwrap-success event off; absent, non-zero, wrong
+    //           type, or unreadable all keep it on. Tested on the pure rule
+    //           (no registry I/O), since setting the real HKLM policy value
+    //           would change this machine's configuration.
+    Check(hkdfguard::ParseAuditUnwrapSuccess(false, 0, 0), "AuditUnwrapSuccess absent: unwrap auditing on");
+    Check(!hkdfguard::ParseAuditUnwrapSuccess(true, REG_DWORD, 0), "AuditUnwrapSuccess REG_DWORD 0: unwrap auditing off");
+    Check(hkdfguard::ParseAuditUnwrapSuccess(true, REG_DWORD, 1), "AuditUnwrapSuccess REG_DWORD 1: unwrap auditing on");
+    Check(hkdfguard::ParseAuditUnwrapSuccess(true, REG_DWORD, 7), "AuditUnwrapSuccess any other non-zero DWORD: unwrap auditing on");
+    Check(hkdfguard::ParseAuditUnwrapSuccess(true, REG_SZ, 0), "AuditUnwrapSuccess of the wrong type (even \"0\"): unwrap auditing stays on");
+    Check(hkdfguard::ParseAuditUnwrapSuccess(true, REG_QWORD, 0), "AuditUnwrapSuccess REG_QWORD 0: unwrap auditing stays on");
+    // The real registry read must agree with "absent" on a machine where the
+    // policy isn't set - true on this test machine unless someone set it.
+    std::printf("    (this machine's effective AuditUnwrapSuccess: %s)\n",
+                hkdfguard::LoadAuditUnwrapSuccess() ? "on" : "off");
+
 #if defined(_MSC_VER)
     // ---- -1. The DLL carries the event log message table. ----
     // The MSI registers HkdfGuard.Kms.Windows.v1.dll as the event source's
@@ -265,7 +281,7 @@ int main() {
     {
         HMODULE dll = GetModuleHandleW(L"HkdfGuard.Kms.Windows.v1.dll");
         Check(dll != nullptr, "the HkdfGuard DLL is loaded in this test process");
-        const DWORD ids[] = {1000, 1001, 2000, 2002, 2003, 2004, 2005};
+        const DWORD ids[] = {1000, 1001, 1002, 1003, 2000, 2002, 2003, 2004, 2005};
         bool allPresent = dll != nullptr;
         for (DWORD id : ids) {
             if (dll == nullptr) break;

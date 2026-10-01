@@ -4,6 +4,7 @@
 #include "wire_format.h" // kProviderTypeTpm / kProviderTypeSoftware
 
 #include <windows.h>
+#include <bcrypt.h> // BCryptHash - payload fingerprint for the wrap/unwrap events
 
 #include <string>
 #include <vector>
@@ -16,6 +17,14 @@
 //   1001 Warning      A KEK was created on the software provider because
 //                     PreferTpm's TPM attempt failed - the key exists, but
 //                     without the hardware protection the policy preferred.
+//   1002 Information  A DEK was wrapped (hkdfguard_wrap_dek or
+//                     hkdfguard_generate_and_wrap_dek).
+//   1003 Information  A DEK was unwrapped.
+//                     Both record the KEK fingerprint and a SHA-256 of the
+//                     wrapped payload, so each unwrap can be matched to the
+//                     wrap that produced it - which also makes a substituted
+//                     older payload visible, since deployment rollback is
+//                     deliberately allowed by the format itself.
 //   2000 Warning      ACCESS_DENIED on any call: someone tried to use (or
 //                     create) a KEK they aren't authorized for, or tried
 //                     to provision without elevation.
@@ -30,8 +39,7 @@
 //   2005 Error        PROVIDER / CRYPTO / INTERNAL: the key storage
 //                     provider or crypto layer itself failed.
 //
-// Not logged: successful wraps and unwraps (routine, and a service may
-// unwrap on every start), INVALID_ARG / BUFFER_TOO_SMALL /
+// Not logged: INVALID_ARG / BUFFER_TOO_SMALL /
 // SERVICE_NAME_INVALID (caller programming errors), and KEK_NOT_FOUND
 // (the normal "provision first" state). Nothing secret is ever logged -
 // only the service name, provider, operation, error code, calling user
@@ -52,6 +60,8 @@ namespace hkdfguard {
         // Must match src/event_messages.mc.
         constexpr DWORD kEvtKekCreated = 1000;
         constexpr DWORD kEvtKekCreatedSoftwareFallback = 1001;
+        constexpr DWORD kEvtDekWrapped = 1002;
+        constexpr DWORD kEvtDekUnwrapped = 1003;
         constexpr DWORD kEvtAccessDenied = 2000;
         constexpr DWORD kEvtKekAclInvalid = 2002;
         constexpr DWORD kEvtIntegrityFailure = 2003;
@@ -103,6 +113,30 @@ namespace hkdfguard {
         // there is no way to smuggle formatting or newlines into an event.
         std::wstring Widen(const std::string &s) {
             return std::wstring(s.begin(), s.end());
+        }
+
+        std::wstring Hex(const uint8_t *bytes, size_t len) {
+            static const wchar_t kDigits[] = L"0123456789abcdef";
+            std::wstring out;
+            out.reserve(len * 2);
+            for (size_t i = 0; i < len; ++i) {
+                out.push_back(kDigits[bytes[i] >> 4]);
+                out.push_back(kDigits[bytes[i] & 0x0F]);
+            }
+            return out;
+        }
+
+        // SHA-256 of a public buffer (the wrapped payload), hex-encoded, or a
+        // placeholder if hashing fails - the event is still worth writing.
+        std::wstring Sha256Hex(const uint8_t *data, size_t len) {
+            uint8_t digest[32] = {};
+            NTSTATUS status = BCryptHash(
+                BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
+                const_cast<PUCHAR>(data), static_cast<ULONG>(len), digest, sizeof(digest));
+            if (!BCRYPT_SUCCESS(status)) {
+                return L"(unavailable)";
+            }
+            return Hex(digest, sizeof(digest));
         }
 
         // The acting user's SID: the thread's impersonation token if there is
@@ -178,6 +212,25 @@ namespace hkdfguard {
                       CodeName(tpmFallbackCode) + L" (" + std::to_wstring(tpmFallbackCode) +
                       L"). This KEK is not hardware-protected.");
             }
+        } catch (...) {
+        }
+    }
+
+    void LogDekOperation(
+        AuditOp op,
+        const std::string &service,
+        uint8_t providerType,
+        const uint8_t *kekFingerprint,
+        const uint8_t *payload,
+        size_t payloadLen) noexcept {
+        try {
+            const bool unwrap = (op == AuditOp::Unwrap);
+            std::wstring text =
+                    std::wstring(OpName(op)) + L" succeeded: DEK " + (unwrap ? L"unwrapped" : L"wrapped") +
+                    L" for service '" + Widen(service) + L"' using the KEK on " + ProviderLabel(providerType) +
+                    L". KEK fingerprint (SHA-256 of public key): " + Hex(kekFingerprint, kFingerprintLen) +
+                    L". Wrapped payload SHA-256: " + Sha256Hex(payload, payloadLen) + L".";
+            Write(EVENTLOG_INFORMATION_TYPE, unwrap ? kEvtDekUnwrapped : kEvtDekWrapped, text);
         } catch (...) {
         }
     }

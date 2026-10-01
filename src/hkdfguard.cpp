@@ -9,6 +9,7 @@
 #include "ecdh_hkdf.h"
 #include "errors.h"
 #include "event_log.h"
+#include "policy.h" // LoadAuditUnwrapSuccess
 #include "kek_store.h"
 #include "secure_buffer.h"
 #include "wire_format.h"
@@ -162,7 +163,9 @@ namespace {
     // exactly one place rather than being duplicated between the two ABI entry
     // points below. Callers are responsible for catching whatever this throws;
     // it does not itself touch the ABI's integer-status-code convention.
-    int32_t WrapDekCore(const char *service, const uint8_t *dek, int32_t dek_len, uint8_t *out, int32_t *out_len) {
+    // `op` only labels the success audit event (Wrap vs GenerateAndWrap).
+    int32_t WrapDekCore(
+        AuditOp op, const char *service, const uint8_t *dek, int32_t dek_len, uint8_t *out, int32_t *out_len) {
         // Basic null-pointer validation before touching any of the pointers.
         // `dek_len`/`out_len` themselves are validated next.
         if (dek == nullptr || out == nullptr || out_len == nullptr) {
@@ -255,6 +258,10 @@ namespace {
         // out-parameter.
         SerializeWrappedDek(kek.provider_type, kek.key_id, ephemeral_pub, nonce, ciphertext, tag, fingerprint, out);
         *out_len = static_cast<int32_t>(kTotalLen);
+
+        // Audit: who wrapped, for which service, under which KEK, and a hash
+        // of the exact payload produced (public bytes only - see event_log.h).
+        LogDekOperation(op, normalized_service, kek.provider_type, fingerprint, out, kTotalLen);
         return HKDFGUARD_OK;
     }
 
@@ -284,7 +291,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
     // whole codebase a C++ exception is allowed to stop, per the "no
     // exception crosses the ABI" requirement.
     try {
-        return WrapDekCore(service, dek, dek_len, out, out_len);
+        return WrapDekCore(AuditOp::Wrap, service, dek, dek_len, out, out_len);
     } catch (const HkdfGuardError &e) {
         // The expected/"normal" failure path: one of our own helpers threw
         // a specific, meaningful status code - recorded in the event log if
@@ -365,7 +372,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
             return Audit(AuditOp::GenerateAndWrap, service, HKDFGUARD_ERR_CRYPTO);
         }
 
-        return WrapDekCore(service, dek.data(), HKDFGUARD_DEK_LEN, out, out_len);
+        return WrapDekCore(AuditOp::GenerateAndWrap, service, dek.data(), HKDFGUARD_DEK_LEN, out, out_len);
     } catch (const HkdfGuardError &e) {
         return Audit(AuditOp::GenerateAndWrap, service, e.code());
     } catch (...) {
@@ -477,6 +484,19 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
         // and only copy - this function never staged it anywhere else),
         // and the caller is told exactly how many bytes that is.
         *out_len = HKDFGUARD_DEK_LEN;
+
+        // Audit: who unwrapped, for which service, under which KEK, and a hash
+        // of the exact payload presented - matching the hash its wrap event
+        // recorded. Hashes the caller's (public) payload buffer, never `out`.
+        // Unless an administrator has turned this one event off via the
+        // AuditUnwrapSuccess policy value (see policy.h) - e.g. for a caller
+        // that legitimately unwraps often. Unwrap *failures* are logged
+        // regardless, in the catch blocks below.
+        if (LoadAuditUnwrapSuccess()) {
+            LogDekOperation(
+                AuditOp::Unwrap, normalized_service, parsed.provider_type, parsed.fingerprint,
+                wrapped, static_cast<size_t>(wrapped_len));
+        }
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
         // Note this correctly covers the auth-failure case too:

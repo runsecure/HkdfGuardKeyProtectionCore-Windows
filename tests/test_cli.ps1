@@ -310,6 +310,16 @@ try {
             $bytes = [System.IO.File]::ReadAllBytes($happyKeyFile)
             Check ($bytes.Length -eq 164) "CLI-produced wrapped file is 164 bytes"
 
+            # The wrap is audited (event 1002) with a SHA-256 of the exact
+            # payload written - the value an unwrap event will later repeat.
+            $payloadHash = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes) |
+                ForEach-Object { $_.ToString("x2") })
+            $wrapped = Find-HkdfEvent -Since $provisionStart -Id 1002 -Needle $payloadHash
+            Check ($wrapped.Count -ge 1) "the wrap is recorded in the Application event log (event 1002) with the payload's SHA-256"
+            if ($wrapped.Count -ge 1) {
+                Check ($wrapped[0].UserId.Value -eq $identity.User.Value) "the wrap event records the calling user"
+            }
+
             $dekBytes2 = New-Object byte[] 32
             [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes2)
             $dekB64_2 = [Convert]::ToBase64String($dekBytes2)

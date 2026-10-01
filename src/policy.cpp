@@ -27,6 +27,11 @@ namespace hkdfguard {
         constexpr wchar_t kKeyUseGroupsValue[] =
             L"KeyUseGroups";
 
+        // REG_DWORD under the same key: see LoadAuditUnwrapSuccess in
+        // policy.h.
+        constexpr wchar_t kAuditUnwrapSuccessValue[] =
+            L"AuditUnwrapSuccess";
+
         // Security-focused default.
         //
         // Existing behavior today is:
@@ -188,6 +193,54 @@ namespace hkdfguard {
         }
 
         return NormalizeEntries(result);
+    }
+
+    bool ParseAuditUnwrapSuccess(bool found, unsigned long type, unsigned long value) noexcept
+    {
+        // Off only for an unambiguous, deliberate REG_DWORD 0. Everything
+        // else - including a value that's present but malformed - keeps
+        // auditing on, the direction that can't hide activity.
+        return !(found && type == REG_DWORD && value == 0);
+    }
+
+    bool LoadAuditUnwrapSuccess() noexcept
+    {
+        HKEY key = nullptr;
+
+        // KEY_WOW64_64KEY - see LoadKeyUseGroupsPolicy's comment on the
+        // identical flag on its own RegOpenKeyExW call.
+        if (RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                kPolicyKey,
+                0,
+                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &key) != ERROR_SUCCESS)
+        {
+            return ParseAuditUnwrapSuccess(false, 0, 0);
+        }
+
+        DWORD value = 0;
+        DWORD type = 0;
+        DWORD size = sizeof(value);
+
+        LONG status = RegQueryValueExW(
+            key,
+            kAuditUnwrapSuccessValue,
+            nullptr,
+            &type,
+            reinterpret_cast<LPBYTE>(&value),
+            &size);
+
+        RegCloseKey(key);
+
+        // A value too large for a DWORD (ERROR_MORE_DATA) or any other read
+        // failure is "not found" here, i.e. auditing stays on.
+        if (status != ERROR_SUCCESS || size != sizeof(value))
+        {
+            return ParseAuditUnwrapSuccess(false, 0, 0);
+        }
+
+        return ParseAuditUnwrapSuccess(true, type, value);
     }
 
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)

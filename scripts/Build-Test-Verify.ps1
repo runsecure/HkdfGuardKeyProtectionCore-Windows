@@ -129,6 +129,9 @@ $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 $dekBytes = New-Object byte[] 32
 $rng.GetBytes($dekBytes)
 $dekBase64 = [Convert]::ToBase64String($dekBytes)
+# Start of this verification's window in the Application event log (a
+# couple of seconds early, to absorb clock granularity).
+$auditStart = (Get-Date).AddSeconds(-2)
 
 if (Test-Path $keyFile) { Remove-Item -Force $keyFile }
 
@@ -226,6 +229,31 @@ public static class HkdfGuardNative {
     }
 
     [Array]::Clear($outBuf, 0, $outBuf.Length)
+
+    # ---- Audit trail: the CLI's wrap and this script's unwrap of the ----
+    #      same payload should each be in the Application event log, under
+    #      this account, carrying the same payload SHA-256 - which is what
+    #      lets an operator tie every unwrap back to the wrap that produced
+    #      it. XPath, not -FilterHashtable, so this works whether or not the
+    #      MSI has registered the event source on this machine.
+    $payloadHash = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($wrapped) |
+        ForEach-Object { $_.ToString("x2") })
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $sinceUtc = $auditStart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    foreach ($check in @(@{ Id = 1002; What = "wrap" }, @{ Id = 1003; What = "unwrap" })) {
+        $xpath = "*[System[Provider[@Name='HkdfGuard.Kms.Windows.v1'] and EventID=$($check.Id) and TimeCreated[@SystemTime>='$sinceUtc']]]"
+        $events = @()
+        try { $events = @(Get-WinEvent -LogName Application -FilterXPath $xpath -ErrorAction Stop) } catch { }
+        $match = @($events | Where-Object {
+            ([string]$_.Properties[0].Value).Contains($payloadHash) -and
+            ([string]$_.Properties[0].Value).Contains("'$service'") -and
+            $_.UserId.Value -eq $me })
+        if ($match.Count -ge 1) {
+            Write-Ok "$($check.What) recorded in the event log (event $($check.Id)) with this payload's SHA-256 and this account"
+        } else {
+            Write-Bad "no $($check.What) event $($check.Id) found for service '$service' with payload SHA-256 $payloadHash"
+        }
+    }
 }
 
 [Array]::Clear($dekBytes, 0, $dekBytes.Length)

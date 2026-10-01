@@ -298,15 +298,40 @@ including the impersonated client when a service acts on someone's behalf.
 |---|---|---|
 | 1000 | Information | A KEK was created (not merely found). |
 | 1001 | Warning | A KEK was created on the software provider because `PreferTpm`'s TPM attempt failed, so it isn't hardware-protected. |
+| 1002 | Information | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
+| 1003 | Information | A DEK was unwrapped. |
 | 2000 | Warning | `ACCESS_DENIED` on any call: use of a KEK by an unauthorized account, or provisioning without elevation. |
 | 2002 | Error | `KEK_ACL_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
 | 2003 | Warning | `AUTH_FAILED`, `KEK_MISMATCH` or `MALFORMED` on unwrap: a tampered, corrupted, or misdirected payload. |
 | 2004 | Error | `INVALID_POLICY` or `GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
 | 2005 | Error | `PROVIDER`, `CRYPTO` or `INTERNAL`: the key storage provider or crypto layer failed. |
 
-Deliberately not logged: successful wraps and unwraps (routine, and a service may unwrap
-on every start), caller mistakes (`INVALID_ARG`, `BUFFER_TOO_SMALL`,
-`SERVICE_NAME_INVALID`), and `KEK_NOT_FOUND`. No key material is ever logged. Logging
+The wrap and unwrap events also record the KEK's fingerprint and a SHA-256 of the
+wrapped payload. Both are public values that reveal nothing about the DEK. Because the
+same payload produces the same hash in its wrap event and in every later unwrap event,
+you can tie each unwrap back to the wrap that produced it. That also makes a substituted
+older payload visible, which matters because the format deliberately allows rollback
+(see the note on what a payload is bound to). To compute a wrapped file's hash for
+comparison: `(Get-FileHash <file> -Algorithm SHA256).Hash.ToLower()`.
+
+Deliberately not logged: caller mistakes (`INVALID_ARG`, `BUFFER_TOO_SMALL`,
+`SERVICE_NAME_INVALID`) and `KEK_NOT_FOUND`. No key material is ever logged. Every
+successful wrap and unwrap writes one event, which suits deployment-time wrapping and
+unwrap-at-service-start.
+
+**Turning off unwrap-success events.** For a caller that legitimately unwraps often, an
+administrator can turn off event 1003 alone with a REG_DWORD value:
+
+```
+reg add HKLM\Software\Policies\HkdfGuard /v AuditUnwrapSuccess /t REG_DWORD /d 0 /f
+```
+
+Only an explicit REG_DWORD `0` turns it off. A missing value, any non-zero DWORD, or a
+value of the wrong type all leave it on, so a misconfigured value can't silently reduce
+auditing. The value is read on every unwrap, so a change takes effect without
+restarting the calling process. It affects nothing else: wrap events and every failure
+event, including failed unwraps, are always written. With it off, the log no longer
+shows who unwrapped successfully or which payload they used. Logging
 is best effort and can never change a call's result. Any local user can write to the
 Application log, so treat these events as an operational aid, not tamper-proof
 evidence. Forward them to your SIEM if you need retention. Running the test suites

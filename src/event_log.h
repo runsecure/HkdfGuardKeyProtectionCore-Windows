@@ -29,6 +29,21 @@ namespace hkdfguard {
     // hardware protection the policy preferred.
     void LogKekCreated(const std::wstring &service, uint8_t providerType, int32_t tpmFallbackCode) noexcept;
 
+    // A wrap (op Wrap or GenerateAndWrap) or unwrap (op Unwrap) succeeded.
+    // Records which KEK was used (its public-key fingerprint) and which
+    // payload (SHA-256 of the 164 wrapped bytes) - both public values that
+    // reveal nothing about the DEK - so an unwrap can be matched back to the
+    // wrap that produced it, and a substituted older payload is visible.
+    // `payload` is the wrapped output (wrap) or input (unwrap); it is only
+    // hashed, never logged.
+    void LogDekOperation(
+        AuditOp op,
+        const std::string &service,
+        uint8_t providerType,
+        const uint8_t *kekFingerprint,
+        const uint8_t *payload,
+        size_t payloadLen) noexcept;
+
     // An ABI call failed with `code`. Only security- or operations-relevant
     // codes produce an event; caller mistakes (bad arguments, buffer too
     // small, malformed service name) and "not provisioned yet" do not.

@@ -169,6 +169,13 @@ administrator.
 - `KeyUseGroups` read failures of any kind yield an empty list (no
   additional principals), never an exception. Entries are trimmed; a bad
   entry fails `hkdfguard_create_kek` before any key is touched.
+- `AuditUnwrapSuccess` fails toward auditing: only an explicit REG_DWORD 0
+  turns off the unwrap-success event (1003), and absent, non-zero,
+  wrong-type or unreadable all leave it on. It never affects failure
+  events or wrap events. **Verified** for the value-to-setting rule by
+  test (`test_roundtrip.cpp` section -2); the switch's effect on a real
+  unwrap is not exercised, since that would mean changing this machine's
+  HKLM policy during a test run.
 - The default `PreferTpm` fallback to software is a **design decision**:
   the policy is the administrator's to set. It falls back only on
   `HKDFGUARD_ERR_PROVIDER` (TPM unavailable, or a create/verify step
@@ -286,9 +293,9 @@ use) are still granted by *name*, now restricted to local groups.
   `HkdfGuard.Kms.Windows.v1`; see README.md "Audit logging") is best
   effort and not tamper-evident. Any local user can write events under
   that source name, and an administrator can clear the log. Treat it as an
-  operational aid, not as evidence. Successful wraps and unwraps are not
-  logged, so it records who *tried and failed* to use a KEK, not who
-  used one.
+  operational aid, not as evidence. The event's User field is supplied by
+  the writing process and not validated by Windows, so a forged event can
+  name any user.
 - Hardening flags `/SDL`, `/Qspectre` and `/CETCOMPAT` are not set. `/Qspectre`
   is the relevant one - the wrapping key and raw ECDH secret exist
   in-process - and requires the Spectre-mitigated libraries with `/MT`.
