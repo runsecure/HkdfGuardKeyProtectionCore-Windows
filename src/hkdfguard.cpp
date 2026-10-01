@@ -8,6 +8,7 @@
 #include "aes_gcm.h"
 #include "ecdh_hkdf.h"
 #include "errors.h"
+#include "event_log.h"
 #include "kek_store.h"
 #include "secure_buffer.h"
 #include "wire_format.h"
@@ -128,6 +129,24 @@ namespace {
             CP_UTF8, MB_ERR_INVALID_CHARS, normalized.c_str(), static_cast<int>(normalized.size()), wide.data(),
             wide_len);
         return wide;
+    }
+
+    // Records a failed call in the event log (see event_log.h for which codes
+    // produce an event) and hands `code` straight back, so every ABI entry
+    // point can write `return Audit(op, service, code);` on its failure
+    // paths without the logging ever changing what the caller receives.
+    // The service is logged in its normalized form; a service argument that
+    // doesn't even validate is logged as "(invalid service name)" rather
+    // than echoed, so nothing but the restricted charset reaches the log.
+    int32_t Audit(AuditOp op, const char *service, int32_t code) noexcept {
+        std::string loggable;
+        try {
+            loggable = NormalizeService(service);
+        } catch (...) {
+            loggable.clear();
+        }
+        LogOperationFailure(op, loggable, code);
+        return code;
     }
 
     // Convenience wrapper for callers (hkdfguard_kek_exists, hkdfguard_create_kek)
@@ -268,9 +287,9 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
         return WrapDekCore(service, dek, dek_len, out, out_len);
     } catch (const HkdfGuardError &e) {
         // The expected/"normal" failure path: one of our own helpers threw
-        // a specific, meaningful status code - just hand it straight back
-        // to the caller.
-        return e.code();
+        // a specific, meaningful status code - recorded in the event log if
+        // it's one worth auditing, then handed straight back to the caller.
+        return Audit(AuditOp::Wrap, service, e.code());
     } catch (...) {
         // `catch (...)` is C++'s "catch absolutely anything" handler - it
         // matches even exception types this code has never heard of (a
@@ -279,7 +298,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
         // makes the ABI's "no exception ever crosses this boundary"
         // guarantee unconditionally true, not just true for the specific
         // exception type this project happens to throw itself.
-        return HKDFGUARD_ERR_INTERNAL;
+        return Audit(AuditOp::Wrap, service, HKDFGUARD_ERR_INTERNAL);
     }
 }
 
@@ -298,9 +317,9 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_kek_exists(
 
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
-        return e.code();
+        return Audit(AuditOp::KekExists, service, e.code());
     } catch (...) {
-        return HKDFGUARD_ERR_INTERNAL;
+        return Audit(AuditOp::KekExists, service, HKDFGUARD_ERR_INTERNAL);
     }
 }
 
@@ -317,9 +336,9 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_create_kek(
 
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
-        return e.code();
+        return Audit(AuditOp::CreateKek, service, e.code());
     } catch (...) {
-        return HKDFGUARD_ERR_INTERNAL;
+        return Audit(AuditOp::CreateKek, service, HKDFGUARD_ERR_INTERNAL);
     }
 }
 
@@ -343,14 +362,14 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
         NTSTATUS status = BCryptGenRandom(
             nullptr, dek.data(), static_cast<ULONG>(HKDFGUARD_DEK_LEN), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         if (!BCRYPT_SUCCESS(status)) {
-            return HKDFGUARD_ERR_CRYPTO;
+            return Audit(AuditOp::GenerateAndWrap, service, HKDFGUARD_ERR_CRYPTO);
         }
 
         return WrapDekCore(service, dek.data(), HKDFGUARD_DEK_LEN, out, out_len);
     } catch (const HkdfGuardError &e) {
-        return e.code();
+        return Audit(AuditOp::GenerateAndWrap, service, e.code());
     } catch (...) {
-        return HKDFGUARD_ERR_INTERNAL;
+        return Audit(AuditOp::GenerateAndWrap, service, HKDFGUARD_ERR_INTERNAL);
     }
 }
 
@@ -469,8 +488,10 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
         // stale plaintext may remain" even though some unauthenticated
         // bytes may have been written into `out` by BCryptDecrypt before it
         // detected the mismatch (see aes_gcm.cpp's comment on that).
-        return fail(e.code());
+        // `fail` (zeroing) runs first, logging second - the buffer is never
+        // left holding unauthenticated bytes while the event is written.
+        return Audit(AuditOp::Unwrap, service, fail(e.code()));
     } catch (...) {
-        return fail(HKDFGUARD_ERR_INTERNAL);
+        return Audit(AuditOp::Unwrap, service, fail(HKDFGUARD_ERR_INTERNAL));
     }
 }

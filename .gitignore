@@ -109,3 +109,8 @@ $RECYCLE.BIN/
 
 # Distribution Folder
 dist/
+
+# WiX extension cache (restored by scripts/Build-Msi.ps1 from the version
+# pinned there; the WiX tool itself is pinned in dotnet-tools.json)
+.wix/
+*.wixpdb

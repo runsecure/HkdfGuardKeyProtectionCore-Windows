@@ -1,11 +1,35 @@
 #include "kek_store.h"
 #include "errors.h"
+#include "event_log.h"
+#include <optional>
 #include <string>
 #include "policy.h"
 #include "key_acl.h"
 
 namespace hkdfguard {
     namespace {
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+        // See SetTestTpmProviderNameOverride in kek_store.h. Empty by
+        // default, so a test binary that never sets it behaves exactly like
+        // the DLL.
+        std::optional<std::wstring> g_testTpmProviderNameOverride;
+#endif
+
+        // The NCrypt provider name used for everything "TPM" in this file.
+        // Always MS_PLATFORM_CRYPTO_PROVIDER in hkdfguard.dll; a test build
+        // may point it at a nonexistent provider to exercise the "no TPM on
+        // this machine" paths deterministically on hardware that has one.
+        LPCWSTR TpmProviderName()
+        {
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+            if (g_testTpmProviderNameOverride.has_value())
+            {
+                return g_testTpmProviderNameOverride->c_str();
+            }
+#endif
+            return MS_PLATFORM_CRYPTO_PROVIDER;
+        }
+
         // Builds the actual name a KEK is persisted under in Windows' key storage:
         // e.g. service "myapp" and key_id 1 becomes L"hkdfguardwin_myapp_v1". The
         // `L"..."` prefix on each string literal marks it as a *wide* string literal
@@ -29,7 +53,7 @@ namespace hkdfguard {
         // kProviderTypeSoftware) to the actual provider name string NCrypt expects.
         // The `?:` ternary operator here is just a compact `if/else` that produces a
         // value: "if provider_type equals kProviderTypeTpm, the result is
-        // MS_PLATFORM_CRYPTO_PROVIDER, otherwise it's MS_KEY_STORAGE_PROVIDER."
+        // TpmProviderName(), otherwise it's MS_KEY_STORAGE_PROVIDER."
         // LPCWSTR ("long pointer to constant wide string" - Windows' own typedef
         // for `const wchar_t*`) is the type both of those provider-name constants
         // have.
@@ -39,7 +63,7 @@ namespace hkdfguard {
             switch (provider_type)
             {
                 case kProviderTypeTpm:
-                    return MS_PLATFORM_CRYPTO_PROVIDER;
+                    return TpmProviderName();
 
                 case kProviderTypeSoftware:
                     return MS_KEY_STORAGE_PROVIDER;
@@ -460,7 +484,10 @@ namespace hkdfguard {
             ThrowForNCryptFailure(status, "NCryptOpenKey failed");
         }
 
-        void CreateKekOnProvider(
+        // Returns true if this call created (and fully verified) a new KEK,
+        // false if a valid one already existed - so the caller logs a
+        // creation event only for an actual creation.
+        bool CreateKekOnProvider(
             const std::wstring& service,
             LPCWSTR providerName,
             uint8_t providerType,
@@ -515,7 +542,17 @@ namespace hkdfguard {
                     policy,
                     providerType);
 
-                return;
+                // An existing key under this service's name is not
+                // necessarily one this library made - anyone with admin
+                // rights could have pre-planted it, or widened its ACL since.
+                // Accepting it as "using existing KEK" without looking would
+                // hand DEKs to whoever that ACL admits. Checked against
+                // policy-independent invariants only (see key_acl.h), so a
+                // KeyUseGroups change since creation - documented as leaving
+                // the existing ACL alone - is still accepted.
+                VerifyExistingKeyAcl(key.get());
+
+                return false;
             }
 
             if (status != NTE_BAD_KEYSET)
@@ -629,43 +666,68 @@ namespace hkdfguard {
                 ThrowForNCryptFailure(status, "NCryptFinalizeKey failed");
             }
 
-            // Verify against a *freshly-reopened* handle, not `key` (the one
-            // still held from creation/finalization): at least one real TPM
-            // KSP (an AMD fTPM's Microsoft Platform Crypto Provider) has
-            // been observed reporting stale/incomplete property values -
-            // NCRYPT_LENGTH_PROPERTY as 0 rather than 256 - when queried on
-            // the creation handle immediately after NCryptFinalizeKey,
-            // while the exact same property on a freshly-opened handle for
-            // the identical, already-finalized key correctly reports 256.
-            // The Software KSP doesn't exhibit this (its creation handle
-            // already reports accurate values), but reopening costs little
-            // and this is what makes verification reliable on both.
-            ScopedNCryptKey verifyKey;
-
-            status =
-                NCryptOpenKey(
-                    provider.get(),
-                    verifyKey.put(),
-                    name.c_str(),
-                    0,
-                    // See OpenKekOnProvider's identical NCryptOpenKey call
-                    // above for why NCRYPT_SILENT_FLAG is added here too.
-                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
-
-            if (status != ERROR_SUCCESS)
+            // From here on, a real persisted key exists that *this call*
+            // created. If any post-finalize step below fails, that key has
+            // never been verified and must not be left behind for a later
+            // OpenKekForWrap to pick up - so it is deleted right here, by
+            // this call, on its own creation handle. This is the only place
+            // in the library that deletes a KEK outside of test cleanup, and
+            // it is deliberately scoped to a key this same call finalized
+            // moments earlier: an *existing* key that fails verification
+            // (the early-return path above) is never touched.
+            try
             {
-                ThrowForNCryptFailure(status, "NCryptOpenKey (post-finalize verification) failed");
+                // Verify against a *freshly-reopened* handle, not `key` (the
+                // one still held from creation/finalization): at least one
+                // real TPM KSP (an AMD fTPM's Microsoft Platform Crypto
+                // Provider) has been observed reporting stale/incomplete
+                // property values - NCRYPT_LENGTH_PROPERTY as 0 rather than
+                // 256 - when queried on the creation handle immediately after
+                // NCryptFinalizeKey, while the exact same property on a
+                // freshly-opened handle for the identical, already-finalized
+                // key correctly reports 256. The Software KSP doesn't exhibit
+                // this (its creation handle already reports accurate values),
+                // but reopening costs little and this is what makes
+                // verification reliable on both.
+                ScopedNCryptKey verifyKey;
+
+                status =
+                    NCryptOpenKey(
+                        provider.get(),
+                        verifyKey.put(),
+                        name.c_str(),
+                        0,
+                        // See OpenKekOnProvider's identical NCryptOpenKey call
+                        // above for why NCRYPT_SILENT_FLAG is added here too.
+                        NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+
+                if (status != ERROR_SUCCESS)
+                {
+                    ThrowForNCryptFailure(status, "NCryptOpenKey (post-finalize verification) failed");
+                }
+
+                VerifyKeyProperties(
+                    verifyKey.get(),
+                    provider.get(),
+                    policy,
+                    providerType);
+
+                VerifyKeyAcl(
+                    verifyKey.get(),
+                    aclGroups);
+            }
+            catch (const HkdfGuardError&)
+            {
+                // Best effort: if the delete itself fails, the original
+                // verification error is still the one worth reporting.
+                // NCryptDeleteKey invalidates the handle even on failure, so
+                // `key` must forget it rather than also free it.
+                NCryptDeleteKey(key.get(), 0);
+                key.release();
+                throw;
             }
 
-            VerifyKeyProperties(
-                verifyKey.get(),
-                provider.get(),
-                policy,
-                providerType);
-
-            VerifyKeyAcl(
-                verifyKey.get(),
-                aclGroups);
+            return true;
         }
     } // namespace
 
@@ -680,7 +742,7 @@ namespace hkdfguard {
             case KeyStoragePolicy::RequireTpm:
                 return KekExistsOnProvider(
                     service,
-                    MS_PLATFORM_CRYPTO_PROVIDER,
+                    TpmProviderName(),
                     kCurrentKeyId);
 
             case KeyStoragePolicy::SoftwareOnly:
@@ -690,12 +752,39 @@ namespace hkdfguard {
                     kCurrentKeyId);
 
             case KeyStoragePolicy::PreferTpm:
-                if (KekExistsOnProvider(
-                        service,
-                        MS_PLATFORM_CRYPTO_PROVIDER,
-                        kCurrentKeyId))
+                try
                 {
-                    return true;
+                    if (KekExistsOnProvider(
+                            service,
+                            TpmProviderName(),
+                            kCurrentKeyId))
+                    {
+                        return true;
+                    }
+                }
+                catch (const HkdfGuardError& e)
+                {
+                    // Mirror CreateKek's and OpenKekForWrap's PreferTpm
+                    // behavior: if the Platform Crypto Provider itself is
+                    // unavailable (no TPM/vTPM on this machine, provider not
+                    // ready), that's a reason to look at the software provider
+                    // instead, not a reason to fail the whole call - otherwise
+                    // hkdfguard_kek_exists (and so the CLI's `provision`) would
+                    // fail outright on exactly the TPM-less hosts PreferTpm's
+                    // fallback exists for, while create and wrap on the same
+                    // host would succeed.
+                    //
+                    // Only HKDFGUARD_ERR_PROVIDER falls through. Anything else -
+                    // in practice HKDFGUARD_ERR_ACCESS_DENIED, meaning a TPM key
+                    // *does* exist and this caller may not open it - must
+                    // propagate as-is: a permissions problem must never be
+                    // misreported as "no KEK provisioned" by quietly answering
+                    // from the software provider instead (see
+                    // KekExistsOnProvider's note on NTE_PERM).
+                    if (e.code() != HKDFGUARD_ERR_PROVIDER)
+                    {
+                        throw;
+                    }
                 }
 
                 return KekExistsOnProvider(
@@ -708,6 +797,13 @@ namespace hkdfguard {
             HKDFGUARD_ERR_INVALID_POLICY,
             "invalid key storage policy");
     }
+
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+    void SetTestTpmProviderNameOverride(std::optional<std::wstring> providerName)
+    {
+        g_testTpmProviderNameOverride = std::move(providerName);
+    }
+#endif
 
     void CreateKek(
         const std::wstring& service)
@@ -729,24 +825,30 @@ namespace hkdfguard {
         {
             case KeyStoragePolicy::RequireTpm:
             {
-                CreateKekOnProvider(
-                    service,
-                    MS_PLATFORM_CRYPTO_PROVIDER,
-                    kProviderTypeTpm,
-                    aclGroups,
-                    policy);
+                if (CreateKekOnProvider(
+                        service,
+                        TpmProviderName(),
+                        kProviderTypeTpm,
+                        aclGroups,
+                        policy))
+                {
+                    LogKekCreated(service, kProviderTypeTpm, HKDFGUARD_OK);
+                }
 
                 return;
             }
 
             case KeyStoragePolicy::SoftwareOnly:
             {
-                CreateKekOnProvider(
-                    service,
-                    MS_KEY_STORAGE_PROVIDER,
-                    kProviderTypeSoftware,
-                    aclGroups,
-                    policy);
+                if (CreateKekOnProvider(
+                        service,
+                        MS_KEY_STORAGE_PROVIDER,
+                        kProviderTypeSoftware,
+                        aclGroups,
+                        policy))
+                {
+                    LogKekCreated(service, kProviderTypeSoftware, HKDFGUARD_OK);
+                }
 
                 return;
             }
@@ -755,58 +857,56 @@ namespace hkdfguard {
             {
                 try
                 {
-                    CreateKekOnProvider(
-                        service,
-                        MS_PLATFORM_CRYPTO_PROVIDER,
-                        kProviderTypeTpm,
-                        aclGroups,
-                        policy);
-                }
-                catch (const HkdfGuardError&)
-                {
-                    // The TPM attempt above can fail at any point along its
-                    // create/finalize/verify sequence - including *after*
-                    // NCryptFinalizeKey has already committed a real,
-                    // persisted TPM key, if the post-finalize reopen or
-                    // VerifyKeyProperties/VerifyKeyAcl steps are what threw
-                    // (see CreateKekOnProvider). Left in place, that key
-                    // would be an orphan this function never reports to the
-                    // caller - worse, a *later* OpenKekForWrap call under
-                    // this same PreferTpm policy tries the TPM first via its
-                    // own, lighter-weight open-and-verify-once path (no
-                    // reopen workaround), and could succeed against exactly
-                    // that never-fully-verified key. An operator who saw
-                    // this call return HKDFGUARD_OK for the software KEK
-                    // would have no way to know wrap might actually be
-                    // routing through a different, unaudited one instead.
-                    //
-                    // Best-effort cleanup before falling back: in the
-                    // overwhelmingly common case (no TPM, or the TPM attempt
-                    // failed before ever finalizing anything - the fail-fast
-                    // NTE_BAD_KEYSET/provider-unavailable paths never
-                    // persist a key), this is a single fast NCryptOpenKey
-                    // that finds nothing and fails, mapped to
-                    // HKDFGUARD_ERR_KEK_NOT_FOUND, which is swallowed here.
-                    // Only in the rare case a key really was left behind
-                    // does this actually delete something - and if the
-                    // delete attempt itself fails for some other reason,
-                    // that's still not fatal: proceeding to create the
-                    // software fallback below is correct either way, since
-                    // this is defense in depth, not the primary guarantee.
-                    try
+                    if (CreateKekOnProvider(
+                            service,
+                            TpmProviderName(),
+                            kProviderTypeTpm,
+                            aclGroups,
+                            policy))
                     {
-                        DeleteKek(service, kProviderTypeTpm, kCurrentKeyId);
+                        LogKekCreated(service, kProviderTypeTpm, HKDFGUARD_OK);
                     }
-                    catch (const HkdfGuardError&)
+                }
+                catch (const HkdfGuardError& e)
+                {
+                    // Fall back to the software provider only for
+                    // HKDFGUARD_ERR_PROVIDER - the TPM is unavailable, or a
+                    // create/verify step failed. Any key this attempt itself
+                    // created and couldn't verify has already been deleted
+                    // inside CreateKekOnProvider, so nothing unverified is
+                    // left on the TPM for a later OpenKekForWrap to find.
+                    //
+                    // This handler used to delete the TPM key itself on *any*
+                    // failure. That was dangerous: CreateKekOnProvider also
+                    // handles a TPM KEK that already exists and is in use,
+                    // and a failure verifying it would have deleted it -
+                    // destroying every DEK wrapped under it. Nothing here
+                    // deletes anything now.
+                    //
+                    // Everything else propagates: ACCESS_DENIED (not elevated
+                    // - the software attempt would fail the same way - or a
+                    // TPM KEK exists that this caller may not open) and
+                    // KEK_ACL_INVALID (a TPM KEK exists with an unacceptable
+                    // ACL). In both "exists" cases, quietly creating a second,
+                    // software KEK beside it would split the service across
+                    // two keys.
+                    if (e.code() != HKDFGUARD_ERR_PROVIDER)
                     {
+                        throw;
                     }
 
-                    CreateKekOnProvider(
-                        service,
-                        MS_KEY_STORAGE_PROVIDER,
-                        kProviderTypeSoftware,
-                        aclGroups,
-                        policy);
+                    // Logged only if this actually creates the software KEK -
+                    // on a TPM-less host every later re-provision also takes
+                    // this branch, but finds the software KEK already there.
+                    if (CreateKekOnProvider(
+                            service,
+                            MS_KEY_STORAGE_PROVIDER,
+                            kProviderTypeSoftware,
+                            aclGroups,
+                            policy))
+                    {
+                        LogKekCreated(service, kProviderTypeSoftware, e.code());
+                    }
                 }
 
                 return;
@@ -828,7 +928,7 @@ namespace hkdfguard {
             case KeyStoragePolicy::RequireTpm:
                 return OpenKekOnProvider(
                     service,
-                    MS_PLATFORM_CRYPTO_PROVIDER,
+                    TpmProviderName(),
                     kProviderTypeTpm,
                     kCurrentKeyId,
                     policy);
@@ -845,12 +945,33 @@ namespace hkdfguard {
                 try {
                     return OpenKekOnProvider(
                         service,
-                        MS_PLATFORM_CRYPTO_PROVIDER,
+                        TpmProviderName(),
                         kProviderTypeTpm,
                         kCurrentKeyId,
                         policy);
                 }
-                catch (const HkdfGuardError&) {
+                catch (const HkdfGuardError& e) {
+                    // Fall through to the software provider only when the TPM
+                    // side genuinely has nothing usable for us: no KEK there
+                    // (KEK_NOT_FOUND - the normal case for a PreferTpm KEK that
+                    // was created on the software fallback), or the provider
+                    // unavailable / a key that failed verification (PROVIDER).
+                    //
+                    // ACCESS_DENIED - and anything else - propagates as-is: it
+                    // means a TPM KEK exists and this caller may not use it.
+                    // Swallowing it would make the software probe below answer
+                    // instead, so an unauthorized caller would be told
+                    // KEK_NOT_FOUND ("nothing provisioned") rather than
+                    // ACCESS_DENIED - the same misreport KekExists is careful
+                    // to avoid. A caller in that position also never has a
+                    // software KEK legitimately waiting for it: PreferTpm only
+                    // creates one when the TPM attempt failed outright.
+                    if (e.code() != HKDFGUARD_ERR_KEK_NOT_FOUND &&
+                        e.code() != HKDFGUARD_ERR_PROVIDER)
+                    {
+                        throw;
+                    }
+
                     return OpenKekOnProvider(
                         service,
                         MS_KEY_STORAGE_PROVIDER,

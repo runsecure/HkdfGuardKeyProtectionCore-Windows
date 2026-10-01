@@ -52,7 +52,34 @@ add_library(hkdfguard SHARED
     src/aes_gcm.cpp
     src/policy.cpp
     src/key_acl.cpp
+    src/event_log.cpp
 )
+
+# Event log message table: mc.exe (Windows SDK) compiles
+# src/event_messages.mc into a resource script, which is linked into the
+# DLL so the DLL itself can be registered (by the MSI) as the
+# "HkdfGuard.Kms.Windows.v1" event source's EventMessageFile. Without a
+# message table Event Viewer still records every event, but renders it with
+# a "description cannot be found" preamble. MSVC builds only - other
+# toolchains (e.g. a MinGW dev build) simply skip the resource; the logging
+# code itself doesn't depend on it.
+if(MSVC)
+    enable_language(RC)
+    find_program(HKDFGUARD_MC_EXE NAMES mc REQUIRED)
+    set(HKDFGUARD_MC_OUT ${CMAKE_CURRENT_BINARY_DIR}/event_messages)
+    add_custom_command(
+        OUTPUT ${HKDFGUARD_MC_OUT}/event_messages.rc ${HKDFGUARD_MC_OUT}/event_messages.h
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${HKDFGUARD_MC_OUT}
+        COMMAND ${HKDFGUARD_MC_EXE} -h ${HKDFGUARD_MC_OUT} -r ${HKDFGUARD_MC_OUT}
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/event_messages.mc
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/event_messages.mc
+        COMMENT "Compiling event log message table"
+        VERBATIM)
+    target_sources(hkdfguard PRIVATE ${HKDFGUARD_MC_OUT}/event_messages.rc)
+    # The generated .rc references MSG00409.bin by bare name; this lets the
+    # resource compiler find it in the mc output directory.
+    target_include_directories(hkdfguard PRIVATE ${HKDFGUARD_MC_OUT})
+endif()
 
 # Names the actual output files (the .dll and its companion .lib import
 # library) after this platform and the wire-format/wrap-protocol version

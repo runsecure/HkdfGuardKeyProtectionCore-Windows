@@ -560,6 +560,121 @@ namespace hkdfguard {
         }
     }
 
+    namespace {
+        // Reads a key's security descriptor (DACL only). `descriptor` owns the
+        // bytes the returned PACL points into, so it must outlive any use of
+        // that PACL. Throws `missingCode` if the key has no DACL at all, or a
+        // NULL DACL - which Windows treats as "everyone, full access" and is
+        // therefore never acceptable on a KEK. A read refused by the provider
+        // as access-denied is reported as HKDFGUARD_ERR_ACCESS_DENIED, not
+        // as a provider fault.
+        PACL ReadKeyDacl(
+            NCRYPT_KEY_HANDLE key,
+            std::vector<BYTE> &descriptor,
+            int32_t missingCode) {
+            DWORD size = 0;
+
+            SECURITY_STATUS status = NCryptGetProperty(
+                key,
+                NCRYPT_SECURITY_DESCR_PROPERTY,
+                nullptr,
+                0,
+                &size,
+                DACL_SECURITY_INFORMATION);
+
+            if (status == ERROR_SUCCESS) {
+                descriptor.assign(size, 0);
+                status = NCryptGetProperty(
+                    key,
+                    NCRYPT_SECURITY_DESCR_PROPERTY,
+                    descriptor.data(),
+                    size,
+                    &size,
+                    DACL_SECURITY_INFORMATION);
+            }
+
+            if (status == NTE_PERM ||
+                status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED)) {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_ACCESS_DENIED,
+                    "not authorized to read the key ACL");
+            }
+
+            if (status != ERROR_SUCCESS) {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "unable to read key ACL");
+            }
+
+            PACL acl = nullptr;
+            BOOL present = FALSE;
+            BOOL defaulted = FALSE;
+
+            if (!GetSecurityDescriptorDacl(
+                reinterpret_cast<PSECURITY_DESCRIPTOR>(
+                    descriptor.data()),
+                &present,
+                &acl,
+                &defaulted)) {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "unable to parse key ACL");
+            }
+
+            if (!present || acl == nullptr) {
+                throw HkdfGuardError(
+                    missingCode,
+                    "key ACL missing or NULL (grants everyone full access)");
+            }
+
+            return acl;
+        }
+    } // namespace
+
+    void VerifyExistingKeyAcl(
+        NCRYPT_KEY_HANDLE key) {
+        std::vector<BYTE> descriptor;
+        PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_KEK_ACL_INVALID);
+
+        // The two principals every KEK this library creates grants, whatever
+        // the policy was at the time.
+        const SidBuffer required[] = {
+            CreateWellKnownSidBuffer(WinLocalSystemSid),
+            CreateWellKnownSidBuffer(WinBuiltinAdministratorsSid),
+        };
+        for (const SidBuffer &sid: required) {
+            if (!DaclContainsSid(acl, const_cast<BYTE *>(sid.data()))) {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_KEK_ACL_INVALID,
+                    "existing KEK's ACL is missing SYSTEM or Administrators - not created by this library");
+            }
+        }
+
+        // Nothing may be granted to a principal this library would never
+        // grant - checked against every allow ACE, whatever its mask, since
+        // even read access on the KEK means the ability to unwrap.
+        for (DWORD i = 0; i < acl->AceCount; ++i) {
+            void *ace = nullptr;
+            if (!GetAce(acl, i, &ace)) {
+                continue;
+            }
+            auto *header = static_cast<ACE_HEADER *>(ace);
+            if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+                continue;
+            }
+            PSID sid = &static_cast<ACCESS_ALLOWED_ACE *>(ace)->SidStart;
+
+            for (WELL_KNOWN_SID_TYPE overBroad: kOverBroadSids) {
+                SidBuffer known = CreateWellKnownSidBuffer(overBroad);
+                if (EqualSid(sid, known.data())) {
+                    throw HkdfGuardError(
+                        HKDFGUARD_ERR_KEK_ACL_INVALID,
+                        "existing KEK's ACL grants access to an over-broad principal");
+                }
+            }
+        }
+    }
+
     void VerifyKeyAcl(
         NCRYPT_KEY_HANDLE key,
         const std::vector<std::wstring> &additionalGroups) {
@@ -567,59 +682,8 @@ namespace hkdfguard {
         // Read security descriptor
         //
 
-        DWORD size = 0;
-
-        SECURITY_STATUS status = NCryptGetProperty(
-            key,
-            NCRYPT_SECURITY_DESCR_PROPERTY,
-            nullptr,
-            0,
-            &size,
-            DACL_SECURITY_INFORMATION);
-
-        if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(
-                HKDFGUARD_ERR_PROVIDER,
-                "unable to read key ACL");
-        }
-
-        std::vector<BYTE> descriptor(size);
-
-        status =
-                NCryptGetProperty(
-                    key,
-                    NCRYPT_SECURITY_DESCR_PROPERTY,
-                    descriptor.data(),
-                    size,
-                    &size,
-                    DACL_SECURITY_INFORMATION);
-
-        if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(
-                HKDFGUARD_ERR_PROVIDER,
-                "unable to read key ACL");
-        }
-
-        PACL acl = nullptr;
-        BOOL present = FALSE;
-        BOOL defaulted = FALSE;
-
-        if (!GetSecurityDescriptorDacl(
-            reinterpret_cast<PSECURITY_DESCRIPTOR>(
-                descriptor.data()),
-            &present,
-            &acl,
-            &defaulted)) {
-            throw HkdfGuardError(
-                HKDFGUARD_ERR_PROVIDER,
-                "unable to parse key ACL");
-        }
-
-        if (!present || acl == nullptr) {
-            throw HkdfGuardError(
-                HKDFGUARD_ERR_PROVIDER,
-                "key ACL missing");
-        }
+        std::vector<BYTE> descriptor;
+        PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_PROVIDER);
 
         //
         // Verify SYSTEM

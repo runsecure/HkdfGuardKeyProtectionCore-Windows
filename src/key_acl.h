@@ -57,6 +57,24 @@ namespace hkdfguard {
         NCRYPT_KEY_HANDLE key,
         const std::vector<std::wstring>& additionalGroups);
 
+    // Checks an *already-existing* KEK's ACL against the invariants every KEK
+    // this library creates satisfies regardless of the KeyUseGroups policy in
+    // force when it was made: a real (non-NULL) DACL is present, SYSTEM and
+    // BUILTIN\Administrators are on it, and it grants nothing - at any access
+    // level - to an over-broad principal (the same list ValidateKeyUseGroups
+    // refuses: Everyone, Authenticated Users, BUILTIN\Users, ...).
+    //
+    // Deliberately does NOT compare against the *current* KeyUseGroups
+    // policy: the ACL is applied only at creation, and a later policy change
+    // leaving an existing KEK untouched is documented, intended behavior (see
+    // hkdfguard_create_kek in hkdfguard.h). This catches a pre-planted or
+    // later-widened key, not policy drift.
+    //
+    // Throws HkdfGuardError(HKDFGUARD_ERR_KEK_ACL_INVALID) on a violation, or
+    // HKDFGUARD_ERR_ACCESS_DENIED if the caller can't read the ACL at all.
+    void VerifyExistingKeyAcl(
+        NCRYPT_KEY_HANDLE key);
+
     // Verifies that the expected principals exist on the key ACL.
     //
     // Intended to be called when opening a KEK to ensure the key

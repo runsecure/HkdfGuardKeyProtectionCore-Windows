@@ -85,6 +85,14 @@ non-interoperable KEKs; the same service name must be passed to both wrap and un
 given payload, since it is not itself recorded in the wrapped bytes (a SHA-256
 fingerprint of the KEK's public key is, though - see the Design section below).
 
+A payload is bound to its service name and KEK, and to nothing release-specific, so a
+DEK wrapped by any earlier release keeps unwrapping for as long as the KEK exists. That's
+deliberate: rolling a deployment back to a previous release has to be able to recover
+that release's DEK. It also means anyone who can replace a wrapped-key file can swap in
+an older payload for the same service. Protect the file itself, which is what the CLI's
+`--group` ACL is for. If your application must refuse older DEKs, it has to check that
+after unwrapping.
+
 `dek_len` must be exactly 32 (`HKDFGUARD_DEK_LEN`). A wrapped payload is always exactly
 164 bytes (`HKDFGUARD_WRAPPED_LEN`) - a fixed size regardless of which KEK provider
 produced it - so callers can allocate output buffers without a size-query round trip.
@@ -126,6 +134,13 @@ wrapper around the ABI above with two subcommands:
   read-only, no one else) - it has nothing to do with the KEK's own ACL, which is
   governed entirely by machine policy (see "Deployment model" above), not by anything
   passed on this command line.
+
+  `--key-file-path` must be a real local file reached through real directories. A
+  symbolic link, junction, or other reparse point at the path or anywhere above it
+  is refused, never followed, with or without `--force` - so a link planted in the
+  output directory cannot redirect a (possibly elevated) `wrap --force` at some other
+  file. Paths through a SUBST or mapped network drive are refused for the same
+  reason; put the file on a real local path.
 
 Example, from an elevated PowerShell prompt - provisioning a KEK once, then wrapping a
 freshly-generated DEK under it on every later release:
@@ -270,6 +285,40 @@ before assuming a new vendor behaves identically to AMD fTPM or Intel PTT.
 If you do exercise this library against either, please fold the result (and
 any new quirks) back into that section.
 
+## Audit logging
+
+The DLL writes security-relevant events to the Windows **Application** event log, source
+`HkdfGuard.Kms.Windows.v1`. The MSI registers that source; without it the events are
+still recorded, just shown in Event Viewer with a "description cannot be found"
+preamble. Each event's text names the API call, the service, the `HKDFGUARD_ERR_*`
+code, and the calling process. The event's User field is the calling account,
+including the impersonated client when a service acts on someone's behalf.
+
+| ID | Level | When |
+|---|---|---|
+| 1000 | Information | A KEK was created (not merely found). |
+| 1001 | Warning | A KEK was created on the software provider because `PreferTpm`'s TPM attempt failed, so it isn't hardware-protected. |
+| 2000 | Warning | `ACCESS_DENIED` on any call: use of a KEK by an unauthorized account, or provisioning without elevation. |
+| 2002 | Error | `KEK_ACL_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
+| 2003 | Warning | `AUTH_FAILED`, `KEK_MISMATCH` or `MALFORMED` on unwrap: a tampered, corrupted, or misdirected payload. |
+| 2004 | Error | `INVALID_POLICY` or `GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
+| 2005 | Error | `PROVIDER`, `CRYPTO` or `INTERNAL`: the key storage provider or crypto layer failed. |
+
+Deliberately not logged: successful wraps and unwraps (routine, and a service may unwrap
+on every start), caller mistakes (`INVALID_ARG`, `BUFFER_TOO_SMALL`,
+`SERVICE_NAME_INVALID`), and `KEK_NOT_FOUND`. No key material is ever logged. Logging
+is best effort and can never change a call's result. Any local user can write to the
+Application log, so treat these events as an operational aid, not tamper-proof
+evidence. Forward them to your SIEM if you need retention. Running the test suites
+writes a burst of these events, since the tests exercise the failure paths on purpose.
+
+To list recent events from PowerShell:
+
+```powershell
+Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='HkdfGuard.Kms.Windows.v1']]]" -MaxEvents 50 |
+    Format-Table TimeCreated, Id, LevelDisplayName, UserId, Message -Wrap
+```
+
 ## Design
 
 - **Crypto**: ephemeral ECDH (P-256) + HKDF-SHA512 + AES-256-GCM, matching the macOS
@@ -294,14 +343,17 @@ any new quirks) back into that section.
 - **KEK lifecycle**: `src/kek_store.cpp` creates the KEK (Platform Crypto Provider first,
   falling back to Software KSP under `PreferTpm`) only via `hkdfguard_create_kek`, which
   also applies the `KeyUseGroups`-driven ACL and is idempotent - safe to call again for
-  an already-provisioned service, which just re-verifies it. `hkdfguard_wrap_dek` and
-  `hkdfguard_unwrap_dek` only ever *open* an existing KEK, never create one; unwrap opens
-  the exact provider/key recorded in the payload. Every create/open/delete call passes
-  `NCRYPT_MACHINE_KEY_FLAG` (and `NCRYPT_SILENT_FLAG`, so a key with an unexpected
-  UI-requiring protection policy fails instead of prompting) - see the Deployment model
-  note above. If a `PreferTpm` creation attempt fails after partially succeeding on the
-  TPM, any orphaned TPM key is best-effort deleted before the software fallback runs, so
-  a later wrap can't silently end up using a key that was never fully verified.
+  an already-provisioned service, which just re-verifies it - including that the existing
+  key's ACL is a real DACL with SYSTEM and Administrators on it and grants nothing to an
+  over-broad principal such as Everyone (`HKDFGUARD_ERR_KEK_ACL_INVALID` otherwise; the
+  key is left untouched). `hkdfguard_wrap_dek` and `hkdfguard_unwrap_dek` only ever *open*
+  an existing KEK, never create one; unwrap opens the exact provider/key recorded in the
+  payload. Every create/open/delete call passes `NCRYPT_MACHINE_KEY_FLAG` (and
+  `NCRYPT_SILENT_FLAG`, so a key with an unexpected UI-requiring protection policy fails
+  instead of prompting) - see the Deployment model note above. If a newly created key fails
+  any post-finalize verification step, that same call deletes it before reporting the
+  error, so a later wrap can't silently end up using a key that was never fully verified.
+  An *existing* KEK is never deleted or replaced by any library call.
 - **Memory security**: `src/secure_buffer.h` (RAII `SecureZeroMemory` wrapper) and
   `src/handle_traits.h` (RAII closers for every NCrypt/BCrypt handle type) ensure key
   material and handles are wiped/closed on every exit path, including exceptions. All
@@ -310,12 +362,77 @@ any new quirks) back into that section.
   function - `BCryptDecrypt` - that can write unauthenticated plaintext before reporting
   a tag mismatch).
 
+## Installing on target machines
+
+The DLL and CLI are installed machine-wide by an MSI, not shipped inside application
+packages (NuGet or otherwise). Each machine gets exactly one copy, in a folder only
+administrators can change, and applications load it from there.
+
+**Building the MSI** (no elevation needed):
+
+```
+scripts\build-msi.bat -Arch x64 -Version 1.0.0 -SignCertThumbprint <thumbprint>
+```
+
+`scripts\Build-Msi.ps1` clean-builds Release via `Build-Dist.ps1`, Authenticode-signs both
+binaries *before* packaging and then the MSI itself, and writes
+`dist\HkdfGuard.Kms.Windows.v1-<version>-win-<arch>.msi`. `-Arch` is `x64` or `ARM64`.
+`-Version` must increase with every release, or the upgrade won't replace the installed
+copy. Omitting `-SignCertThumbprint` produces an unsigned MSI, which is for local testing
+only. Afterwards the script reads the built MSI's own tables back and fails if the
+package doesn't install exactly what's described below. The WiX toolset (5.0.2) is
+pinned in `dotnet-tools.json` and restored automatically; only the .NET SDK is required.
+
+**Installing** (elevated; deployable as-is through Intune, SCCM or Group Policy):
+
+```
+msiexec /i HkdfGuard.Kms.Windows.v1-1.0.0-win-x64.msi /qn /l*v install.log
+```
+
+The MSI does four things:
+
+- **Installs both files** to `C:\Program Files\HkdfGuard\Kms.Windows.v1\`. That folder
+  inherits the Program Files ACL, where only Administrators, SYSTEM and TrustedInstaller
+  can write. This is what stops a less-privileged user from planting a fake DLL next to
+  the CLI and getting code execution the next time an administrator runs the elevated
+  `provision` step. The location is deliberately not overridable from the `msiexec`
+  command line, so nobody can redirect the install into a user-writable folder.
+- **Records the folder** in `HKLM\Software\HkdfGuard\Kms.Windows.v1`, value `InstallPath`
+  (`REG_SZ`, with a trailing backslash). Only administrators can change it.
+- **Registers the event log source** `HkdfGuard.Kms.Windows.v1`, so the audit events
+  described under "Audit logging" render cleanly in Event Viewer.
+- **Creates the local group `HkdfGuardUsers`** if it doesn't already exist. KEKs created
+  while the group exists grant it use access, so add the accounts that need to wrap or
+  unwrap to it. The group has to exist before a service's KEK is provisioned to be
+  included, so install the MSI first.
+
+Then, once per service, elevated:
+
+```
+"C:\Program Files\HkdfGuard\Kms.Windows.v1\hkdfguard-v1-initialize.exe" provision --service-name myapp
+```
+
+**Upgrades** remove the previous version before installing the new one. A service with
+the DLL loaded keeps it locked, so stop those services first, or Windows Installer will
+ask to close them or schedule a reboot.
+
+**Uninstalling** removes the files, the `InstallPath` value and the event source
+registration (past events keep their text), and deliberately nothing
+else:
+
+- **KEKs are never touched.** Deleting one destroys every DEK wrapped under it.
+- **The `HkdfGuardUsers` group is kept.** Every KEK created while it existed has the
+  group's SID in its ACL. A recreated group gets a new SID, which would silently lock its
+  members out of those KEKs.
+
+`KeyStoragePolicy` and `KeyUseGroups` are not set by the MSI. They stay with whatever
+already manages machine policy (Group Policy, Intune, SCCM).
+
 ## Consuming from other languages
 
 This repository only implements the native Windows library and its C ABI. To call it
-from C#, Python, Java, Go, or Node, build `HkdfGuard.Kms.Windows.v1.dll` (see
-`CMakeLists.txt`'s `OUTPUT_NAME`) and bind to it with the platform's standard FFI
-mechanism.
+from C#, Python, Java, Go, or Node, install the MSI above and bind to the installed
+`HkdfGuard.Kms.Windows.v1.dll` with the platform's standard FFI mechanism.
 
 **Load it by its full, known path - never by a bare filename.** Every binding below that
 accepts just a name (`"hkdfguard.dll"`, `Native.load("hkdfguard", ...)`, a bare-name
@@ -325,8 +442,9 @@ directory or other locations a lower-privileged or otherwise unexpected file cou
 occupy. Since this library exists specifically to protect a Data Encryption Key, a
 process that can get a different DLL loaded in its place has effectively compromised
 whatever secret the real library would have protected, however carefully the real
-library guards it. Resolve the absolute path to the exact copy you built or were given
-(next to your application is fine; relying on `PATH` search is not) and load *that*, and
+library guards it. Resolve the absolute path from the `InstallPath` registry value the MSI
+writes (relying on `PATH` search, or on a copy sitting in your own application folder, is
+not equivalent) and load *that*, and
 prefer an explicit, non-searching load API over a bare-name one wherever the binding
 layer offers one (e.g. .NET's `NativeLibrary.Load(absolutePath)` over a bare-name
 `[DllImport]`; `LoadLibraryEx` with `LOAD_LIBRARY_SEARCH_APPLICATION_DIR` over a bare
@@ -334,9 +452,19 @@ layer offers one (e.g. .NET's `NativeLibrary.Load(absolutePath)` over a bare-nam
 trusted, also sign the shipped DLL (Authenticode) and verify that signature before
 loading it.
 
-- **C#**: `[DllImport(@"<absolute-path>\HkdfGuard.Kms.Windows.v1.dll")]`, or (preferred)
-  `NativeLibrary.Load(<absolute-path>)` plus `GetExport`/delegates, which never performs
-  a name-based search at all
+- **C#**: `NativeLibrary.Load(<absolute-path>)` plus `GetExport`/delegates, which never
+  performs a name-based search at all. The calling process must match the installed
+  architecture: an x64 process for the x64 MSI, an ARM64 process for the ARM64 MSI. A
+  32-bit process, or an x64 process on an ARM64 machine with the ARM64 MSI installed,
+  cannot load the DLL. Read the path from the 64-bit registry view:
+
+  ```csharp
+  using var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+  using var key = hklm.OpenSubKey(@"Software\HkdfGuard\Kms.Windows.v1")
+      ?? throw new InvalidOperationException("HkdfGuard KMS is not installed");
+  string dir = (string)key.GetValue("InstallPath")!;
+  IntPtr lib = NativeLibrary.Load(Path.Combine(dir, "HkdfGuard.Kms.Windows.v1.dll"));
+  ```
 - **Python**: `ctypes.WinDLL(r"<absolute-path>\HkdfGuard.Kms.Windows.v1.dll")`
 - **Java**: JNA's `NativeLibrary.getInstance("<absolute-path>")`, or a thin JNI shim that
   calls `LoadLibraryW` with an absolute path

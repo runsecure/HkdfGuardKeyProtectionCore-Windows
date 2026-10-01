@@ -4,10 +4,26 @@
 #include "wire_format.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace hkdfguard {
+
+    // Test-only seam: redirects every "TPM" provider open in kek_store.cpp
+    // (KekExists / CreateKek / OpenKekForWrap under RequireTpm and PreferTpm,
+    // and unwrap/delete of a kProviderTypeTpm key) from
+    // MS_PLATFORM_CRYPTO_PROVIDER to `providerName` - pointing it at a name
+    // no provider is registered under makes this machine look TPM-less, so
+    // the PreferTpm fallback and RequireTpm fail-closed paths can be tested
+    // deterministically on hardware that does have a TPM. std::nullopt
+    // clears it. Same scope and caveats as policy.h's SetTestPolicyOverride:
+    // compiled in only when HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined
+    // (tests/CMakeLists.txt, for test_roundtrip's own copy of kek_store.cpp),
+    // never in hkdfguard.dll; not thread-safe, by design.
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+    void SetTestTpmProviderNameOverride(std::optional<std::wstring> providerName);
+#endif
 
     // Every `service` parameter below is used verbatim to build the
     // persisted KEK's name (see kek_store.cpp's KeyName) - this layer does

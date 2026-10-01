@@ -18,6 +18,9 @@ add_executable(test_roundtrip
     # unwrap-side point-validation gate) directly, with hand-built valid and
     # invalid points, without needing a provisioned KEK or elevation.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/ecdh_hkdf.cpp
+    # event_log.cpp: kek_store.cpp's CreateKek logs KEK creation, so this
+    # test's own compiled copy of kek_store.cpp needs it too.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
 )
 # Links against hkdfguard (the DLL's import library, for the public ABI
 # calls) plus the two raw Windows crypto libraries directly (needed because

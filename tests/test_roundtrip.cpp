@@ -12,6 +12,7 @@
 #include "errors.h"     // HkdfGuardError - caught by EphemeralGateResult below to read the gate's error code
 #include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
 
+#include <aclapi.h>  // SetEntriesInAclW - section 25d widens an existing KEK's ACL
 #include <cstdio>
 #include <cstring>
 #include <stdexcept> // std::exception, caught in CleanupKek and CheckPolicyCreatesKek
@@ -251,6 +252,39 @@ std::wstring PickNarrowGroup() {
 int main() {
     std::vector<uint8_t> dek = MakeDek();
     int32_t rc;
+
+#if defined(_MSC_VER)
+    // ---- -1. The DLL carries the event log message table. ----
+    // The MSI registers HkdfGuard.Kms.Windows.v1.dll as the event source's
+    // EventMessageFile, so Event Viewer renders each event by looking its ID
+    // up in the DLL's message table. Missing IDs would show as "the
+    // description for Event ID ... cannot be found". Checked against the
+    // DLL this test actually loaded (it links against it), for every ID
+    // event_log.cpp writes. Needs no elevation and no KEK. MSVC builds
+    // only: other toolchains don't compile the message table at all.
+    {
+        HMODULE dll = GetModuleHandleW(L"HkdfGuard.Kms.Windows.v1.dll");
+        Check(dll != nullptr, "the HkdfGuard DLL is loaded in this test process");
+        const DWORD ids[] = {1000, 1001, 2000, 2002, 2003, 2004, 2005};
+        bool allPresent = dll != nullptr;
+        for (DWORD id : ids) {
+            if (dll == nullptr) break;
+            // With FORMAT_MESSAGE_ARGUMENT_ARRAY the last parameter is
+            // really an array of insertion pointers, typed as va_list*.
+            DWORD_PTR args[1] = {reinterpret_cast<DWORD_PTR>(L"probe-text")};
+            wchar_t text[64] = {};
+            DWORD n = FormatMessageW(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY, dll, id,
+                MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), text, 64,
+                reinterpret_cast<va_list *>(args));
+            if (n == 0 || std::wcsncmp(text, L"probe-text", 10) != 0) {
+                std::printf("    (event ID %lu: FormatMessage returned %lu, error %lu)\n", id, n, GetLastError());
+                allPresent = false;
+            }
+        }
+        Check(allPresent, "the DLL's message table renders every event ID event_log.cpp writes");
+    }
+#endif
 
     // ---- 0. hkdfguard_kek_exists / hkdfguard_create_kek lifecycle. ----
     // kServiceLifecycle has never been used before this point in the test,
@@ -1019,6 +1053,151 @@ int main() {
     }
     Check(wrap_rejects_invalid_policy, "wrap fails closed with INVALID_POLICY for an unrecognized policy value");
 
+    hkdfguard::SetTestPolicyOverride(std::nullopt);
+
+    // ---- 25c. A machine with no usable TPM (bare server, VM without a ----
+    //           vTPM, container) under the default PreferTpm policy: every
+    //           entry point must agree on falling through to the software
+    //           provider. Simulated by redirecting the "TPM" provider name
+    //           at one no provider is registered under (see kek_store.h's
+    //           SetTestTpmProviderNameOverride - a test-only seam, absent
+    //           from hkdfguard.dll), so this is deterministic on hardware
+    //           that does have a TPM. Guards against the regression where
+    //           KekExists threw HKDFGUARD_ERR_PROVIDER here while CreateKek
+    //           and OpenKekForWrap on the same host happily fell back -
+    //           which made hkdfguard_kek_exists, and so the CLI's
+    //           `provision`, fail on exactly the hosts the fallback is for.
+    //           The RequireTpm half checks the opposite contract: with no
+    //           TPM, "exists?" must fail closed with PROVIDER rather than
+    //           answer from the software provider.
+    constexpr const wchar_t* kServiceNoTpmWide = L"hkdfguardwin.test.policy.notpm";
+    hkdfguard::SetTestTpmProviderNameOverride(L"HkdfGuardWin Test: No Such Provider");
+
+    hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::PreferTpm);
+    bool no_tpm_exists_is_false = false;
+    try {
+        no_tpm_exists_is_false = !hkdfguard::KekExists(kServiceNoTpmWide);
+    } catch (const hkdfguard::HkdfGuardError &e) {
+        std::printf("    (KekExists threw code %d: %s)\n", e.code(), e.what());
+    } catch (...) {
+    }
+    Check(no_tpm_exists_is_false, "PreferTpm with no TPM: KekExists falls through to software and reports false (not PROVIDER)");
+
+    // The create/exists/open/delete sequence needs elevation like every other
+    // KEK creation in this suite; without it, this reports a failure that is
+    // part of the known non-elevated cascade.
+    try {
+        hkdfguard::CreateKek(kServiceNoTpmWide);
+        Check(true, "PreferTpm with no TPM: create_kek falls back to the software provider");
+        Check(hkdfguard::KekExists(kServiceNoTpmWide), "PreferTpm with no TPM: KekExists reports true via the software provider afterward");
+        hkdfguard::ResolvedKek kek = hkdfguard::OpenKekForWrap(kServiceNoTpmWide);
+        Check(kek.provider_type == hkdfguard::kProviderTypeSoftware, "PreferTpm with no TPM: the KEK actually opened is software-backed");
+        hkdfguard::DeleteKek(kServiceNoTpmWide, hkdfguard::kProviderTypeSoftware, hkdfguard::kCurrentKeyId);
+    } catch (const std::exception &e) {
+        Check(false, "PreferTpm with no TPM: create/exists/open/delete sequence should succeed (elevated)");
+        std::printf("    (%s)\n", e.what());
+    }
+
+    hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::RequireTpm);
+    bool require_tpm_no_tpm_fails_closed = false;
+    try {
+        hkdfguard::KekExists(kServiceNoTpmWide);
+    } catch (const hkdfguard::HkdfGuardError &e) {
+        require_tpm_no_tpm_fails_closed = (e.code() == HKDFGUARD_ERR_PROVIDER);
+    } catch (...) {
+    }
+    Check(require_tpm_no_tpm_fails_closed, "RequireTpm with no TPM: KekExists fails closed with PROVIDER, never answers from software");
+
+    hkdfguard::SetTestPolicyOverride(std::nullopt);
+    hkdfguard::SetTestTpmProviderNameOverride(std::nullopt);
+
+    // ---- 25d. Re-provisioning a KEK whose ACL has been widened since ----
+    //           creation (or that was pre-planted with a wide ACL) fails
+    //           with HKDFGUARD_ERR_KEK_ACL_INVALID, and the key is left
+    //           exactly where it was - never deleted or replaced. Before
+    //           this check, create_kek accepted any existing key under the
+    //           service's name as "already provisioned" without looking at
+    //           who it admits. SoftwareOnly keeps this off the TPM so it's
+    //           deterministic; elevated-only (KEK creation), so it's part of
+    //           the known cascade when not elevated.
+    constexpr const wchar_t* kServiceAclWidenedWide = L"hkdfguardwin.test.aclwidened";
+    hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::SoftwareOnly);
+    bool acl_widened_created = false;
+    try {
+        hkdfguard::CreateKek(kServiceAclWidenedWide);
+        acl_widened_created = true;
+
+        // Re-provisioning an untouched KEK is still fine (baseline for the
+        // check below - the new ACL check must not reject our own keys).
+        Check(
+            InternalCreateKekResult(kServiceAclWidenedWide) == HKDFGUARD_OK,
+            "create_kek accepts its own, unmodified existing KEK");
+
+        // Widen the finalized key's DACL to include Everyone, as an
+        // administrator (or a pre-planted key) could.
+        NCRYPT_PROV_HANDLE prov = 0;
+        NCRYPT_KEY_HANDLE key = 0;
+        SECURITY_STATUS st = NCryptOpenStorageProvider(&prov, MS_KEY_STORAGE_PROVIDER, 0);
+        if (st == ERROR_SUCCESS) {
+            st = NCryptOpenKey(prov, &key, L"hkdfguardwin_hkdfguardwin.test.aclwidened_v1", 0,
+                               NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+        }
+        bool widened = false;
+        if (st == ERROR_SUCCESS) {
+            BYTE sys[SECURITY_MAX_SID_SIZE], adm[SECURITY_MAX_SID_SIZE], world[SECURITY_MAX_SID_SIZE];
+            DWORD s1 = sizeof(sys), s2 = sizeof(adm), s3 = sizeof(world);
+            CreateWellKnownSid(WinLocalSystemSid, nullptr, sys, &s1);
+            CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, adm, &s2);
+            CreateWellKnownSid(WinWorldSid, nullptr, world, &s3);
+            EXPLICIT_ACCESSW ea[3] = {};
+            PSID sids[3] = {sys, adm, world};
+            ACCESS_MASK masks[3] = {GENERIC_ALL, GENERIC_ALL, GENERIC_READ};
+            for (int i = 0; i < 3; ++i) {
+                ea[i].grfAccessPermissions = masks[i];
+                ea[i].grfAccessMode = GRANT_ACCESS;
+                ea[i].grfInheritance = NO_INHERITANCE;
+                ea[i].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+                ea[i].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+                ea[i].Trustee.ptstrName = static_cast<LPWSTR>(sids[i]);
+            }
+            PACL acl = nullptr;
+            if (SetEntriesInAclW(3, ea, nullptr, &acl) == ERROR_SUCCESS) {
+                SECURITY_DESCRIPTOR sd{};
+                InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+                SetSecurityDescriptorDacl(&sd, TRUE, acl, FALSE);
+                DWORD need = 0;
+                MakeSelfRelativeSD(&sd, nullptr, &need);
+                std::vector<BYTE> rel(need);
+                if (MakeSelfRelativeSD(&sd, rel.data(), &need)) {
+                    widened = NCryptSetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, rel.data(),
+                                                static_cast<DWORD>(rel.size()), DACL_SECURITY_INFORMATION) ==
+                              ERROR_SUCCESS;
+                }
+                LocalFree(acl);
+            }
+        }
+        if (key) NCryptFreeObject(key);
+        if (prov) NCryptFreeObject(prov);
+        Check(widened, "test setup: existing KEK's ACL widened to grant Everyone read");
+
+        if (widened) {
+            Check(
+                InternalCreateKekResult(kServiceAclWidenedWide) == HKDFGUARD_ERR_KEK_ACL_INVALID,
+                "create_kek rejects an existing KEK whose ACL grants an over-broad principal (KEK_ACL_INVALID)");
+            Check(
+                hkdfguard::KekExists(kServiceAclWidenedWide),
+                "a KEK rejected for its ACL is left in place, not deleted");
+        }
+    } catch (const std::exception &e) {
+        Check(false, "widened-ACL scenario: KEK setup should succeed (elevated)");
+        std::printf("    (%s)\n", e.what());
+    }
+    if (acl_widened_created) {
+        try {
+            hkdfguard::DeleteKek(kServiceAclWidenedWide, hkdfguard::kProviderTypeSoftware, hkdfguard::kCurrentKeyId);
+        } catch (...) {
+        }
+    }
     hkdfguard::SetTestPolicyOverride(std::nullopt);
 
     // ---- Cleanup. ----

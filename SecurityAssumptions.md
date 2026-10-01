@@ -32,6 +32,17 @@ defended against:
   name), never by recovering the old one. A genuinely new KEK is obtained by
   versioning the service name (`myapp.v2`), so `KeyId` is pinned to `1`
   forever and `ParseWrappedDek` rejects any other value.
+- **Deployment rollback is supported, so there is no anti-rollback
+  binding.** A payload is bound to the service name and the KEK's
+  fingerprint, and to nothing release-specific. Every DEK ever wrapped
+  under a service's KEK keeps unwrapping, which is what lets a deployment
+  roll back to a previous release and still recover that release's DEK.
+  The consequence is accepted: anyone who can replace the wrapped-key file
+  can substitute an older payload for the same service, and unwrap will
+  return that older DEK. The defense is the wrapped file's ACL (owner
+  read/write, one group read-only - see the CLI's `--group`), not the
+  payload format. An application that needs to refuse old DEKs must check
+  that itself, after unwrapping.
 - **Local Administrators and SYSTEM are fully trusted.** They always hold
   full control of every KEK, can change the registry policy, and can alter a
   key's ACL. Nothing here defends the KEK against a host administrator.
@@ -158,14 +169,22 @@ administrator.
 - `KeyUseGroups` read failures of any kind yield an empty list (no
   additional principals), never an exception. Entries are trimmed; a bad
   entry fails `hkdfguard_create_kek` before any key is touched.
-- The default `PreferTpm` fallback to software, and the fact that its
-  catch-all also swallows verification failures on an *existing* TPM key
-  (not just "no key"), are **design decisions**: the policy is the
-  administrator's to set. If a `PreferTpm` creation fails after
-  `NCryptFinalizeKey` succeeded, the orphaned TPM key is best-effort
-  deleted before the software fallback runs, so a later wrap cannot
-  silently route through a never-verified key. The orphan path itself has
-  no deterministic test (it needs a post-finalize fault).
+- The default `PreferTpm` fallback to software is a **design decision**:
+  the policy is the administrator's to set. It falls back only on
+  `HKDFGUARD_ERR_PROVIDER` (TPM unavailable, or a create/verify step
+  failed). `ACCESS_DENIED` and `KEK_ACL_INVALID` propagate instead, since
+  both mean a TPM KEK already exists, and creating a second, software KEK
+  beside it would split the service across two keys. `OpenKekForWrap` and
+  `KekExists` follow the same rule, so an unauthorized caller is told
+  `ACCESS_DENIED`, never `KEK_NOT_FOUND`.
+- If any post-finalize step fails (reopen, property verification, ACL
+  verification), `CreateKekOnProvider` deletes the key *it just created*,
+  on its own creation handle, before rethrowing, under every policy. That
+  is the only KEK deletion outside test cleanup. An earlier version did
+  this in `PreferTpm`'s fallback handler instead, which could also delete
+  an *existing*, in-use TPM KEK whose verification failed, destroying every
+  DEK wrapped under it; it no longer can. The post-finalize failure path
+  itself has no deterministic test (it needs a post-finalize fault).
 
 ## 8. Key-use principals are host-local (verified)
 
@@ -200,9 +219,16 @@ use) are still granted by *name*, now restricted to local groups.
 - The KEK's ACL is applied once, at creation, and never re-verified on open:
   the OS enforces the DACL on every use, so an unauthorized caller gets
   `NTE_PERM` (surfaced as `HKDFGUARD_ERR_ACCESS_DENIED`). **Design
-  decision.** Verification at creation is presence-only; it does not detect
-  an ACL that was later *widened* (which requires `WRITE_DAC`, i.e. an
-  administrator).
+  decision.** A fresh key's ACL is checked for the presence of every
+  principal it was granted. An *existing* key found by
+  `hkdfguard_create_kek` is checked against policy-independent invariants
+  instead: a real (non-NULL) DACL, SYSTEM and Administrators present, and
+  no grant of any kind to an over-broad principal. Failing that returns
+  `HKDFGUARD_ERR_KEK_ACL_INVALID` and leaves the key untouched. This
+  catches a pre-planted key or one later widened to e.g. Everyone. It does
+  not catch a widening to some other specific account, and it does not run
+  on wrap or unwrap, which never re-verify the ACL. **Verified** by test
+  section 25d (elevated).
 - Key-use access is granted as `GENERIC_READ` on the key object, on the
   understanding that for CNG KSP keys read access permits using the private
   key (`NCryptSecretAgreement`) while `GENERIC_WRITE`/`GENERIC_ALL` are
@@ -239,9 +265,9 @@ use) are still granted by *name*, now restricted to local groups.
 
 ## 11. Things established about the build, not the crypto (verified)
 
-- The test-only policy/group override seams (`SetTestPolicyOverride`,
-  `SetTestKeyUseGroupsOverride`) exist only when
-  `HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE` is defined, which only
+- The test-only override seams (`SetTestPolicyOverride`,
+  `SetTestKeyUseGroupsOverride`, `SetTestTpmProviderNameOverride`) exist
+  only when `HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE` is defined, which only
   `tests/CMakeLists.txt` does; a `strings` scan of the built DLL finds no
   trace of them.
 - No `NCRYPT_OVERWRITE_KEY_FLAG` is ever passed, so a concurrent
@@ -256,8 +282,13 @@ use) are still granted by *name*, now restricted to local groups.
 
 ## 12. Known gaps (not yet addressed)
 
-- No audit trail: KEK creation, ACL application, policy rejections and
-  `PreferTpm` fallbacks write nothing to the Windows Event Log.
+- The audit trail (Application event log, source
+  `HkdfGuard.Kms.Windows.v1`; see README.md "Audit logging") is best
+  effort and not tamper-evident. Any local user can write events under
+  that source name, and an administrator can clear the log. Treat it as an
+  operational aid, not as evidence. Successful wraps and unwraps are not
+  logged, so it records who *tried and failed* to use a KEK, not who
+  used one.
 - Hardening flags `/SDL`, `/Qspectre` and `/CETCOMPAT` are not set. `/Qspectre`
   is the relevant one - the wrapping key and raw ECDH secret exist
   in-process - and requires the Spectre-mitigated libraries with `/MT`.

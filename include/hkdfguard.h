@@ -96,6 +96,7 @@ extern "C" {
 #define HKDFGUARD_ERR_KEK_MISMATCH    (-11) /* payload's KEK fingerprint does not match the KEK it routes to */
 #define HKDFGUARD_ERR_KEK_NOT_FOUND   (-12) /* no KEK is provisioned for this service (call hkdfguard_create_kek first) */
 #define HKDFGUARD_ERR_ACCESS_DENIED   (-13) /* this KEK exists, but the calling account is not authorized to use it */
+#define HKDFGUARD_ERR_KEK_ACL_INVALID (-14) /* an existing KEK's ACL is missing, lacks SYSTEM/Administrators, or grants an over-broad principal */
 
 /*
  * Reports whether a persistent KEK already exists for `service`, without
@@ -143,7 +144,15 @@ HKDFGUARD_API int32_t hkdfguard_kek_exists(
  * The ACL is applied only when the KEK is first created. Changing the
  * policy afterwards does not alter an existing KEK's ACL; a later call for
  * an already-provisioned service verifies the key and returns HKDFGUARD_OK
- * without modifying access.
+ * without modifying access. That verification does check the existing ACL
+ * against invariants that hold for every KEK this library creates,
+ * independent of policy: it must be a real (non-NULL) DACL, it must include
+ * SYSTEM and BUILTIN\Administrators, and it must grant nothing to an
+ * over-broad principal (the same list rejected above). A key failing any of
+ * these - most plausibly one pre-planted under this service's name, or one
+ * whose ACL was later widened - fails the call with
+ * HKDFGUARD_ERR_KEK_ACL_INVALID and is left exactly as found; it is never
+ * modified, replaced or deleted.
  *
  * service - see hkdfguard_wrap_dek.
  *

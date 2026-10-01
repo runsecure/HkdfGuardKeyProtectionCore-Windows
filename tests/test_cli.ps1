@@ -77,8 +77,14 @@ function Invoke-Cli {
     }
     $proc = [System.Diagnostics.Process]::Start($psi)
     if ($null -ne $StdIn) {
-        $proc.StandardInput.Write($StdIn)
-        $proc.StandardInput.Close()
+        # The child may legitimately exit before consuming all of stdin (e.g.
+        # the oversized-input scenario), which can surface here as a broken
+        # pipe; that's the child's behavior under test, not a harness error.
+        try {
+            $proc.StandardInput.Write($StdIn)
+            $proc.StandardInput.Close()
+        } catch [System.IO.IOException] {
+        }
     }
     $stdout = $proc.StandardOutput.ReadToEnd()
     $stderr = $proc.StandardError.ReadToEnd()
@@ -160,6 +166,64 @@ try {
     Check ($r.ExitCode -eq 1) "wrap existing file without --force exits 1"
     Check ((Get-Content -Path $existingFile -Raw) -eq "pre-existing content") "wrap existing file without --force is left untouched"
 
+    # ---- 11b. The wrapped-key path must be a real file at a real location: ----
+    #           a junction (creatable without any privilege, unlike a file
+    #           symlink) anywhere in the path is refused before any KEK or DEK
+    #           work happens, both without and with --force. Without this, an
+    #           attacker who can plant a link in the output directory could
+    #           redirect an elevated `wrap --force` at an arbitrary file.
+    $realDir = Join-Path $workDir "real"
+    $linkDir = Join-Path $workDir "link"
+    New-Item -ItemType Directory -Force -Path $realDir | Out-Null
+    New-Item -ItemType Junction -Path $linkDir -Target $realDir | Out-Null
+
+    # (a) No --force, leaf doesn't exist, parent is a junction: refused, and
+    #     nothing is created in the junction's target directory.
+    $viaLinkNew = Join-Path $linkDir "new.key"
+    $r = Invoke-Cli @(
+        "wrap", "--key-file-path", $viaLinkNew, "--service-name", "svc", "--dek-stdin",
+        "--group", "Users") -StdIn $validB64
+    Check ($r.ExitCode -eq 1) "wrap through a junction (new file) exits 1"
+    Check (-not (Test-Path (Join-Path $realDir "new.key"))) "wrap through a junction does not create the file in the junction target"
+    # Matched on wording that only appears in the CLI's own message, never in
+    # a file path, so a different error that merely echoes the path can't
+    # pass this check by accident.
+    Check ($r.StdErr -match "reparse point|resolves through") "wrap through a junction names the link as the reason"
+
+    # (b) --force, parent is a junction, target file exists: refused, and the
+    #     target file is left completely untouched (not overwritten, not
+    #     deleted).
+    $realTarget = Join-Path $realDir "target.key"
+    Set-Content -Path $realTarget -Value "must survive" -NoNewline
+    $viaLinkForce = Join-Path $linkDir "target.key"
+    $r = Invoke-Cli @(
+        "wrap", "--key-file-path", $viaLinkForce, "--service-name", "svc", "--dek-stdin",
+        "--group", "Users", "--force") -StdIn $validB64
+    Check ($r.ExitCode -eq 1) "wrap --force through a junction exits 1"
+    Check ((Test-Path $realTarget) -and ((Get-Content -Path $realTarget -Raw) -eq "must survive")) "wrap --force through a junction leaves the junction target file untouched"
+
+    # (c) The output path *is* the junction: refused.
+    $r = Invoke-Cli @(
+        "wrap", "--key-file-path", $linkDir, "--service-name", "svc", "--dek-stdin",
+        "--group", "Users", "--force") -StdIn $validB64
+    Check ($r.ExitCode -eq 1) "wrap with the junction itself as the output path exits 1"
+
+    # A junction must be removed as a directory entry, never recursed into
+    # (that would delete the target's contents); cmd's rmdir does exactly that.
+    & cmd /c rmdir "$linkDir" | Out-Null
+
+    # ---- 11c. Oversized stdin is refused rather than buffered without ----
+    #           bound: the reader uses one fixed allocation so DEK text is
+    #           never left behind in a freed, unwiped buffer, which means a
+    #           hard input cap. 5000 bytes is past the 4096-byte limit.
+    $oversizeKeyFile = Join-Path $workDir "oversize.key"
+    $r = Invoke-Cli @(
+        "wrap", "--key-file-path", $oversizeKeyFile, "--service-name", "svc", "--dek-stdin",
+        "--group", "Users") -StdIn ("A" * 5000)
+    Check ($r.ExitCode -eq 1) "wrap with oversized stdin exits 1"
+    Check (-not (Test-Path $oversizeKeyFile)) "wrap with oversized stdin does not create the key file"
+    Check ($r.StdErr -match "larger than") "wrap with oversized stdin says why"
+
     # ---- 12. wrap against a service that was never provisioned reports an ----
     #          error (HKDFGUARD_ERR_KEK_NOT_FOUND) rather than silently
     #          failing or creating a KEK. Opening a nonexistent key fails
@@ -171,7 +235,31 @@ try {
         "--group", "Users") -StdIn $validB64
     Check ($r.ExitCode -eq 1) "wrap against a never-provisioned service exits 1"
     Check (-not (Test-Path $noKekFile)) "wrap against a never-provisioned service does not create the key file"
-    Check ($r.StdErr -match "KEK|provision") "wrap against a never-provisioned service reports a KEK-not-found/provision error"
+    # Exact library wording, not just "KEK": the output file is named
+    # no-kek.key, so a looser pattern would match any error echoing the path.
+    Check ($r.StdErr -match "no KEK is provisioned for this service") "wrap against a never-provisioned service reports a KEK-not-found/provision error"
+
+    # Finds an event this run caused in the Application log under the
+    # library's event source. Matched on the event's insertion string (the
+    # full text event_log.cpp builds), which is present whether or not the
+    # source is registered on this machine - so this works on a dev box
+    # where the MSI was never installed, too.
+    #
+    # XPath rather than -FilterHashtable: the hashtable's ProviderName key
+    # looks up the provider's registration and throws ("The parameter is
+    # incorrect") when the source isn't registered, which is the normal
+    # state before the MSI is installed. Get-WinEvent also reports "no
+    # events found" as an error, hence the try/catch.
+    function Find-HkdfEvent([datetime]$Since, [int]$Id, [string]$Needle) {
+        $sinceUtc = $Since.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        $xpath = "*[System[Provider[@Name='HkdfGuard.Kms.Windows.v1'] and EventID=$Id and TimeCreated[@SystemTime>='$sinceUtc']]]"
+        try {
+            $events = Get-WinEvent -LogName Application -FilterXPath $xpath -ErrorAction Stop
+        } catch {
+            return @()
+        }
+        return @($events | Where-Object { $_.Properties.Count -ge 1 -and ([string]$_.Properties[0].Value).Contains($Needle) })
+    }
 
     # ---- 13. Full provision + wrap via the CLI, plus a --force overwrite - ----
     #          needs a real machine-wide KEK, so only runs when elevated.
@@ -185,12 +273,22 @@ try {
         # reject a hyphenated name like the other tests' "hkdfguard-*" ones.
         $serviceName = "hkdfguardclitest"
 
+        $provisionStart = (Get-Date).AddSeconds(-2)
         $pr = Invoke-Cli @("provision", "--service-name", $serviceName)
         Check ($pr.ExitCode -eq 0) "provision succeeds (elevated)"
         if ($pr.ExitCode -ne 0) {
             Write-Host "    exit code: $($pr.ExitCode)"
             Write-Host "    stdout: $($pr.StdOut)"
             Write-Host "    stderr: $($pr.StdErr)"
+        }
+
+        # Only a genuine creation is logged; if a previous interrupted run
+        # left this KEK behind, provision just confirms it and there is
+        # nothing to look for.
+        if ($pr.StdOut -match "created KEK") {
+            $created = @(Find-HkdfEvent -Since $provisionStart -Id 1000 -Needle "'$serviceName'") +
+                       @(Find-HkdfEvent -Since $provisionStart -Id 1001 -Needle "'$serviceName'")
+            Check ($created.Count -ge 1) "KEK creation is recorded in the Application event log (event 1000/1001)"
         }
 
         $dekBytes = New-Object byte[] 32
@@ -243,6 +341,23 @@ try {
         }
     } else {
         Write-Host "[INFO] skipping provision/full-wrap/--force scenarios: not elevated (machine-wide KEK creation requires Administrator)"
+
+        # ---- 13b. Not elevated: a provision attempt is refused, and the ----
+        #           refusal is recorded in the Application event log (event
+        #           2000, access denied) with the service name. A fresh
+        #           service name, so no existing KEK can change the outcome.
+        $deniedService = "hkdfguardevt" + [Guid]::NewGuid().ToString("N")
+        $deniedStart = (Get-Date).AddSeconds(-2)
+        $r = Invoke-Cli @("provision", "--service-name", $deniedService)
+        Check ($r.ExitCode -eq 1) "provision without elevation is refused"
+        $denied = Find-HkdfEvent -Since $deniedStart -Id 2000 -Needle "'$deniedService'"
+        Check ($denied.Count -ge 1) "the refused provision is recorded in the Application event log (event 2000)"
+        if ($denied.Count -ge 1) {
+            $evt = $denied[0]
+            Check ([string]$evt.Properties[0].Value -match "HKDFGUARD_ERR_ACCESS_DENIED") "the event names the error code"
+            Check ($evt.UserId -and $evt.UserId.Value -eq $identity.User.Value) "the event records the calling user"
+            Check ($evt.LevelDisplayName -eq "Warning" -or $evt.Level -eq 3) "the event is logged as a warning"
+        }
     }
 }
 finally {
