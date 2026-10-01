@@ -1,6 +1,6 @@
 # HkdfGuardWin
 
-Windows-native equivalent of a Secure Enclave-backed DEK (Data Encryption Key) wrapper.
+Windows-native Key Wrapper.
 Wraps and unwraps a 32-byte key using a persistent, machine-wide scoped, non-exportable
 P-256 ECDH Key Encryption Key (KEK) held by a TPM/vTPM via the Microsoft Platform Crypto
 Provider, or by the Microsoft Software Key Storage Provider - which one is machine
@@ -96,20 +96,101 @@ Ephemeral Data Protection Key - the plaintext DEK never crosses back out to the 
 it's zeroed internally the moment it's wrapped. Recover it later via
 `hkdfguard_unwrap_dek` on the resulting payload, with the same `service`.
 
+## Command-line tool
+
+`tools/hkdfguard-v1-initialize.cpp` builds `hkdfguard-v1-initialize.exe`, a thin
+wrapper around the ABI above with two subcommands:
+
+- **`provision`** - calls `hkdfguard_kek_exists`, then `hkdfguard_create_kek` if
+  missing. Never wraps a DEK, never touches a file. This is the *only* subcommand that
+  can create a KEK, and (see "Deployment model" above) needs an elevated process the
+  first time a given service name is used; confirming an already-provisioned one does
+  not.
+
+  ```
+  hkdfguard-v1-initialize.exe provision --service-name|-sn <name>
+  ```
+
+- **`wrap`** - calls `hkdfguard_wrap_dek` only, against an *already-provisioned* KEK;
+  it never creates one (a missing KEK fails with `HKDFGUARD_ERR_KEK_NOT_FOUND` and a
+  hint to run `provision` first). The DEK is 32 raw bytes, base64-encoded, read from
+  **stdin** rather than a command-line argument, specifically so it never appears in
+  this process's `argv`, where another process on the same host could otherwise read
+  it via a command-line/process listing (e.g. a WMI query) for the life of the run.
+
+  ```
+  hkdfguard-v1-initialize.exe wrap --key-file-path|-kf <path> --service-name|-sn <name> --dek-stdin --group|-g <name> [--force|-f]
+  ```
+
+  `--group|-g` sets the wrapped **file's** Windows ACL (owner read/write, that group
+  read-only, no one else) - it has nothing to do with the KEK's own ACL, which is
+  governed entirely by machine policy (see "Deployment model" above), not by anything
+  passed on this command line.
+
+Example, from an elevated PowerShell prompt - provisioning a KEK once, then wrapping a
+freshly-generated DEK under it on every later release:
+
+```powershell
+# One-time, elevated: create the KEK for this service if it doesn't already exist.
+.\hkdfguard-v1-initialize.exe provision --service-name myapp
+
+# Every release: mint a random 32-byte DEK and wrap it, piping the base64 DEK to the
+# tool's stdin rather than passing it as an argument.
+$dekBytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes)
+$dekBase64 = [Convert]::ToBase64String($dekBytes)
+$dekBase64 | .\hkdfguard-v1-initialize.exe wrap `
+    --key-file-path C:\secrets\myapp.v1.key --service-name myapp `
+    --dek-stdin --group Users --force
+```
+
+`--help`/`-h` at the top level, or after either subcommand, prints usage for that
+level. Exit code `0` is success, `2` is a usage/argument error (nothing was attempted),
+and `1` is an operational failure (parsing succeeded but the operation itself failed -
+see the printed `error: ...` text and `include/hkdfguard.h`'s `HKDFGUARD_ERR_*` codes
+for what it means). There is no `unwrap` subcommand - unwrapping is DLL-only; see
+"Consuming from other languages" below for calling `hkdfguard_unwrap_dek` directly.
+
 ## Building
 
 Requires CMake 3.20+, a Windows 10/11 SDK, and an MSVC C++17 toolchain (Visual Studio
 2022 Build Tools with the "Desktop development with C++" workload, or equivalent).
 
 **Recommended: `scripts\run-build-test-verify.bat`.** Double-click it, or run it from
-any shell - it self-elevates (UAC prompt) if not already Administrator, locates the
-MSVC/CMake/Ninja toolchain from the Visual Studio Build Tools install, configures,
-builds, runs the full `ctest` suite, and does an additional end-to-end check that wraps
-a random DEK with the CLI tool and independently unwraps it via a direct call into the
-built DLL. Elevation is required up front because both `ctest` (below) and the
-end-to-end check create machine-wide KEKs.
+any shell. It's a thin, self-elevating wrapper: if the shell it's launched from isn't
+already Administrator, it relaunches itself with a UAC prompt, then hands off to
+`scripts\Build-Test-Verify.ps1` (below) and forwards it any arguments you passed.
+Elevation is required up front because both `ctest` and the end-to-end verification
+step create machine-wide KEKs.
 
-Or manually, from an already-elevated shell:
+```
+scripts\run-build-test-verify.bat [-Configuration Release] [-Group "Some Group"] [-NoCleanup]
+```
+
+**`scripts\Build-Test-Verify.ps1`** does the actual work, and can also be run directly
+from an *already*-elevated shell (it checks for Administrator itself and refuses to
+proceed otherwise) if you'd rather skip the UAC prompt:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\Build-Test-Verify.ps1 -Configuration Debug -Group Users
+```
+
+It locates the MSVC/CMake/Ninja toolchain from the Visual Studio Build Tools install,
+configures and builds the project, runs the full `ctest` suite (see below), then does
+one further end-to-end check outside of `ctest`: provisions a throwaway KEK, wraps a
+random 32-byte DEK with the real CLI, and independently unwraps it via a direct
+P/Invoke call into the built DLL - proving the CLI's output is actually consumable by
+an external caller, not just by the CLI itself. Parameters:
+
+- **`-Configuration`** (`Debug` or `Release`, default `Debug`) - the CMake build
+  configuration to use.
+- **`-Group`** (default `Users`) - the group passed to the verification wrap's
+  `--group`, i.e. who gets read-only access to the throwaway wrapped-key file it
+  produces.
+- **`-NoCleanup`** - skip deleting the verification KEK and wrapped-key file
+  afterward, if you want to inspect them.
+
+Or build and test manually, from an already-elevated shell:
 
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -125,7 +206,8 @@ model" above.
 This produces `build/HkdfGuard.Kms.Windows.v1.dll` (+ its `.lib` import library) and
 `build/tools/hkdfguard-v1-initialize.exe`, and registers two tests with `ctest`:
 
-- `roundtrip` (`tests/test_roundtrip.cpp`) exercises the public ABI end to end: KEK
+- **`roundtrip`** (`tests/test_roundtrip.cpp`, built to `build/tests/test_roundtrip.exe`)
+  exercises the public ABI end to end, by linking directly against the built DLL: KEK
   provisioning (`hkdfguard_kek_exists`/`hkdfguard_create_kek`, including that wrap fails
   with `KEK_NOT_FOUND` before a KEK is provisioned), a basic wrap/unwrap roundtrip and
   KEK reuse across repeated calls, case-insensitive service names, the `KeyUseGroups`
@@ -134,10 +216,26 @@ This produces `build/HkdfGuard.Kms.Windows.v1.dll` (+ its `.lib` import library)
   forced via an internal test-only seam so this doesn't depend on the machine's real
   registry policy or TPM availability), invalid-argument and buffer-too-small handling,
   that the output buffer is zeroed on every malformed-payload/authentication-failure/
-  KEK-mismatch path, and `hkdfguard_generate_and_wrap_dek`.
-- `cli` (`tests/test_cli.ps1`) exercises `hkdfguard-v1-initialize.exe`'s own argument
-  parsing, validation, and file-handling - including, when elevated, a full
-  provision-then-wrap-then-`--force`-overwrite run through the real CLI.
+  KEK-mismatch path, and `hkdfguard_generate_and_wrap_dek`. It never spawns the CLI. Run
+  it directly (the DLL must be findable - `ctest` arranges this automatically via
+  `tests/CMakeLists.txt`'s `ENVIRONMENT PATH` property, but a direct run needs it on
+  `PATH` yourself):
+
+  ```
+  build\tests\test_roundtrip.exe
+  ```
+
+- **`cli`** (`tests/test_cli.ps1`) exercises `hkdfguard-v1-initialize.exe`'s own
+  subcommand dispatch, argument parsing, validation, and file-handling by spawning the
+  real built `.exe` as a subprocess - including, when elevated, a full
+  provision-then-wrap-then-`--force`-overwrite run through it, and (unconditionally,
+  since it needs no elevation) that `wrap` against a never-provisioned service reports
+  a clear error rather than silently failing or creating a KEK. It takes the CLI's path
+  as a required parameter, so it can also be pointed at any build of the tool:
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File tests\test_cli.ps1 -CliExePath build\tools\hkdfguard-v1-initialize.exe
+  ```
 
 Both tests delete any KEKs they create once they finish, so repeated runs don't
 accumulate persisted keys in the machine's key storage.
@@ -148,6 +246,29 @@ Run the full suite elevated on a machine with an active TPM to exercise the
 software fallback. The Software Key Storage Provider path (`provider_type` 2) shares the
 same code apart from which NCrypt provider name is opened, and is exercised by the same
 suite's `SoftwareOnly` policy check regardless of whether a TPM is present.
+
+## Testing and compatibility
+
+This library has been exercised end to end - KEK creation, wrap, unwrap, and
+the `RequireTpm`/`PreferTpm`/`SoftwareOnly` policy paths - against:
+
+- **Intel PTT** (Platform Trust Technology - Intel's firmware TPM), via the
+  Microsoft Platform Crypto Provider
+- **AMD fTPM** (firmware TPM), via the Microsoft Platform Crypto Provider -
+  see `SecurityAssumptions.md` section 4 for the specific provider quirks
+  found (and accommodated in `src/kek_store.cpp`) on this vendor
+- The **Microsoft Software Key Storage Provider** (the software fallback
+  path), which is vendor-independent
+
+It has **not yet been tested** against a discrete (dTPM) hardware TPM from
+**Infineon** or **Nuvoton**. Both are legitimate Microsoft Platform Crypto
+Provider backends and are expected to work, but neither has actually been
+run against this code. A discrete TPM's own firmware could in principle
+report key properties or usage flags differently than the two firmware TPMs
+above do - see the accommodation table in `SecurityAssumptions.md` section 4
+before assuming a new vendor behaves identically to AMD fTPM or Intel PTT.
+If you do exercise this library against either, please fold the result (and
+any new quirks) back into that section.
 
 ## Design
 
